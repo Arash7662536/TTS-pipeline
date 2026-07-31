@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "persian-tts-frontend"
+version = "1.0.0"
+description = "Persian text normalization frontend for VoxCPM 2 fine-tuning"
+requires-python = ">=3.9"
+dependencies = []          # stdlib only; transformers needed only for scripts/run_audit.py
+
+[project.optional-dependencies]
+audit = ["transformers>=4.40"]
+
+[tool.setuptools]
+packages = ["persian_tts_frontend"]

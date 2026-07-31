@@ -1,0 +1,243 @@
+{
+  "_meta": {
+    "purpose": "Seed list of Persian homographs -- words whose bare orthography maps to more than one pronunciation. Serves two roles in the build plan: (1) the closed list for Track B forced resolution, where the diacritizer's uncertainty is NOT accepted and the word is routed to a stronger resolver; (2) the `priority` set passed to diacritics.mask(), so these words keep their marks preferentially during Stage A masking.",
+    "status": "SEED -- deliberately small and high-confidence. Extend from the HomoRich dataset (Qharabagh et al. 2025) and from your own corpus frequency counts. Do not treat this as complete; it is a starting point, not a lexicon.",
+    "usage": "from json import load; H = load(open('homographs_seed.json'))['homographs']; PRIORITY = set(H)",
+    "readings_are_candidates": "The `forms` list doubles as the candidate set for audio-grounded disambiguation: generate one variant per form, then let Gemini-multimodal (audio + transcript) pick the one that matches what was actually spoken.",
+    "ipa_convention": "Broad transcription. æ=fatha, e=kasra, o=damma, ɒ=alef, ʃ=sh, x=kh, ɢ=gh/q, ʒ=zh, tʃ=ch, dʒ=j, ʔ=hamza/ayn."
+  },
+  "homographs": {
+    "مرد": [
+      {"form": "مَرْد", "ipa": "mæɾd", "gloss": "man"},
+      {"form": "مُرْد", "ipa": "moɾd", "gloss": "died"}
+    ],
+    "کرم": [
+      {"form": "کِرْم", "ipa": "keɾm", "gloss": "worm"},
+      {"form": "کَرَم", "ipa": "kæɾæm", "gloss": "generosity"},
+      {"form": "کِرِم", "ipa": "keɾem", "gloss": "cream (loanword)"}
+    ],
+    "شکر": [
+      {"form": "شِکَر", "ipa": "ʃekæɾ", "gloss": "sugar"},
+      {"form": "شُکْر", "ipa": "ʃokɾ", "gloss": "gratitude"}
+    ],
+    "گل": [
+      {"form": "گُل", "ipa": "gol", "gloss": "flower"},
+      {"form": "گِل", "ipa": "gel", "gloss": "mud, clay"}
+    ],
+    "سر": [
+      {"form": "سَر", "ipa": "sæɾ", "gloss": "head"},
+      {"form": "سِرّ", "ipa": "seɾː", "gloss": "secret"}
+    ],
+    "مهر": [
+      {"form": "مِهْر", "ipa": "mehɾ", "gloss": "affection; the month Mehr"},
+      {"form": "مُهْر", "ipa": "mohɾ", "gloss": "seal, stamp"}
+    ],
+    "علم": [
+      {"form": "عِلْم", "ipa": "ʔelm", "gloss": "knowledge, science"},
+      {"form": "عَلَم", "ipa": "ʔælæm", "gloss": "banner, standard"}
+    ],
+    "خرد": [
+      {"form": "خِرَد", "ipa": "xeɾæd", "gloss": "wisdom"},
+      {"form": "خُرْد", "ipa": "xoɾd", "gloss": "tiny, minor"}
+    ],
+    "سم": [
+      {"form": "سُم", "ipa": "som", "gloss": "hoof"},
+      {"form": "سَمّ", "ipa": "sæmː", "gloss": "poison"}
+    ],
+    "کشت": [
+      {"form": "کِشْت", "ipa": "keʃt", "gloss": "cultivation, crop"},
+      {"form": "کُشْت", "ipa": "koʃt", "gloss": "killed"}
+    ],
+    "تن": [
+      {"form": "تَن", "ipa": "tæn", "gloss": "body"},
+      {"form": "تُن", "ipa": "ton", "gloss": "ton; tuna"}
+    ],
+    "دم": [
+      {"form": "دَم", "ipa": "dæm", "gloss": "breath, moment"},
+      {"form": "دُم", "ipa": "dom", "gloss": "tail"}
+    ],
+    "گرد": [
+      {"form": "گِرْد", "ipa": "geɾd", "gloss": "round"},
+      {"form": "گَرْد", "ipa": "gæɾd", "gloss": "dust"}
+    ],
+    "ملک": [
+      {"form": "مِلْک", "ipa": "melk", "gloss": "property, estate"},
+      {"form": "مَلِک", "ipa": "mælek", "gloss": "king"},
+      {"form": "مَلَک", "ipa": "mælæk", "gloss": "angel"}
+    ],
+    "کند": [
+      {"form": "کُنْد", "ipa": "kond", "gloss": "blunt, slow"},
+      {"form": "کَنَد", "ipa": "kænæd", "gloss": "he/she digs"},
+      {"form": "کَنْد", "ipa": "kænd", "gloss": "dug"}
+    ],
+    "پست": [
+      {"form": "پُسْت", "ipa": "post", "gloss": "post, mail"},
+      {"form": "پَسْت", "ipa": "pæst", "gloss": "low, base"}
+    ],
+    "قدم": [
+      {"form": "قَدَم", "ipa": "ɢædæm", "gloss": "step, pace"},
+      {"form": "قِدَم", "ipa": "ɢedæm", "gloss": "antiquity"}
+    ],
+    "بر": [
+      {"form": "بَر", "ipa": "bæɾ", "gloss": "on, upon; fruit"},
+      {"form": "بُر", "ipa": "boɾ", "gloss": "cut, shuffle"}
+    ],
+    "درد": [
+      {"form": "دَرْد", "ipa": "dæɾd", "gloss": "pain"},
+      {"form": "دُرْد", "ipa": "doɾd", "gloss": "dregs, sediment"}
+    ],
+    "شست": [
+      {"form": "شَسْت", "ipa": "ʃæst", "gloss": "thumb"},
+      {"form": "شُسْت", "ipa": "ʃost", "gloss": "washed"}
+    ],
+    "روم": [
+      {"form": "رُم", "ipa": "ɾom", "gloss": "Rome"},
+      {"form": "رَوَم", "ipa": "ɾævæm", "gloss": "I go"}
+    ],
+    "سفر": [
+      {"form": "سَفَر", "ipa": "sæfæɾ", "gloss": "journey"},
+      {"form": "سِفْر", "ipa": "sefɾ", "gloss": "book, scroll (scriptural)"}
+    ],
+    "صبر": [
+      {"form": "صَبْر", "ipa": "sɒbɾ", "gloss": "patience"},
+      {"form": "صَبِر", "ipa": "sɒbeɾ", "gloss": "aloe"}
+    ],
+    "حسن": [
+      {"form": "حَسَن", "ipa": "hæsæn", "gloss": "Hasan (name)"},
+      {"form": "حُسْن", "ipa": "hosn", "gloss": "beauty, merit"}
+    ],
+    "عمر": [
+      {"form": "عُمْر", "ipa": "ʔomɾ", "gloss": "lifespan"},
+      {"form": "عُمَر", "ipa": "ʔomæɾ", "gloss": "Omar (name)"}
+    ],
+    "نقل": [
+      {"form": "نَقْل", "ipa": "næɢl", "gloss": "narration, transfer"},
+      {"form": "نُقْل", "ipa": "noɢl", "gloss": "sweetmeats"}
+    ],
+    "حکم": [
+      {"form": "حُکْم", "ipa": "hokm", "gloss": "verdict, decree"},
+      {"form": "حَکَم", "ipa": "hækæm", "gloss": "arbiter"}
+    ],
+    "کل": [
+      {"form": "کُلّ", "ipa": "kolː", "gloss": "whole, total"},
+      {"form": "کَل", "ipa": "kæl", "gloss": "bald"}
+    ],
+    "برد": [
+      {"form": "بُرْد", "ipa": "boɾd", "gloss": "won; carried"},
+      {"form": "بَرْد", "ipa": "bæɾd", "gloss": "cold"}
+    ],
+    "رفت": [
+      {"form": "رَفْت", "ipa": "ɾæft", "gloss": "went"},
+      {"form": "رُفْت", "ipa": "ɾoft", "gloss": "swept"}
+    ],
+    "شور": [
+      {"form": "شور", "ipa": "ʃuɾ", "gloss": "salty"},
+      {"form": "شَور", "ipa": "ʃowɾ", "gloss": "fervour, ardour"}
+    ],
+    "بره": [
+      {"form": "بَرِّه", "ipa": "bæɾːe", "gloss": "lamb"},
+      {"form": "بُرِه", "ipa": "boɾe", "gloss": "let him cut"}
+    ],
+    "سپر": [
+      {"form": "سِپَر", "ipa": "sepæɾ", "gloss": "shield"},
+      {"form": "سِپُر", "ipa": "sepoɾ", "gloss": "entrust (imperative)"}
+    ],
+    "نظر": [
+      {"form": "نَظَر", "ipa": "næzæɾ", "gloss": "view, opinion"},
+      {"form": "نِظَر", "ipa": "nezæɾ", "gloss": "(rare) glance"}
+    ],
+    "طلب": [
+      {"form": "طَلَب", "ipa": "tælæb", "gloss": "demand, claim"},
+      {"form": "طُلَب", "ipa": "tolæb", "gloss": "(plural) students"}
+    ],
+    "قصر": [
+      {"form": "قَصْر", "ipa": "ɢæsɾ", "gloss": "palace"},
+      {"form": "قِصَر", "ipa": "ɢesæɾ", "gloss": "shortness"}
+    ],
+    "بست": [
+      {"form": "بَسْت", "ipa": "bæst", "gloss": "closed, tied"},
+      {"form": "بُسْت", "ipa": "bost", "gloss": "Bost (placename)"}
+    ],
+    "چین": [
+      {"form": "چین", "ipa": "tʃin", "gloss": "China; fold, pleat"},
+      {"form": "چِین", "ipa": "tʃin", "gloss": "pick (imperative)"}
+    ],
+    "شکل": [
+      {"form": "شِکْل", "ipa": "ʃekl", "gloss": "shape, form"},
+      {"form": "شَکْل", "ipa": "ʃækl", "gloss": "vocalisation, diacritics"}
+    ],
+    "حرم": [
+      {"form": "حَرَم", "ipa": "hæɾæm", "gloss": "shrine, sanctuary"},
+      {"form": "حَرِم", "ipa": "hæɾem", "gloss": "harem"}
+    ],
+    "نرم": [
+      {"form": "نَرْم", "ipa": "næɾm", "gloss": "soft"},
+      {"form": "نَرَم", "ipa": "næɾæm", "gloss": "I do not go"}
+    ],
+    "مات": [
+      {"form": "مات", "ipa": "mɒt", "gloss": "checkmate; dull, matte"},
+      {"form": "مَات", "ipa": "mɒt", "gloss": "stunned"}
+    ],
+    "قرن": [
+      {"form": "قَرْن", "ipa": "ɢæɾn", "gloss": "century"},
+      {"form": "قِرَن", "ipa": "ɢeɾæn", "gloss": "(rare) conjunction"}
+    ],
+    "جمع": [
+      {"form": "جَمْع", "ipa": "dʒæmʔ", "gloss": "sum, gathering, plural"},
+      {"form": "جُمَع", "ipa": "dʒomæʔ", "gloss": "Fridays"}
+    ],
+    "محل": [
+      {"form": "مَحَلّ", "ipa": "mæhælː", "gloss": "place, locality"},
+      {"form": "مُحِلّ", "ipa": "mohelː", "gloss": "one who permits"}
+    ],
+    "رد": [
+      {"form": "رَدّ", "ipa": "ɾædː", "gloss": "rejection; trace"},
+      {"form": "رِد", "ipa": "ɾed", "gloss": "(loanword) red"}
+    ],
+    "خورد": [
+      {"form": "خورْد", "ipa": "xoɾd", "gloss": "ate, drank"},
+      {"form": "خُرْد", "ipa": "xoɾd", "gloss": "small, minor"}
+    ],
+    "پخت": [
+      {"form": "پُخْت", "ipa": "poxt", "gloss": "cooked (verb)"},
+      {"form": "پَخْت", "ipa": "pæxt", "gloss": "the cooking, cuisine"}
+    ],
+    "بند": [
+      {"form": "بَنْد", "ipa": "bænd", "gloss": "tie, clause, joint"},
+      {"form": "بِنْد", "ipa": "bend", "gloss": "tie (imperative)"}
+    ],
+    "لطف": [
+      {"form": "لُطْف", "ipa": "lotf", "gloss": "kindness"},
+      {"form": "لَطْف", "ipa": "lætf", "gloss": "(variant) subtlety"}
+    ],
+    "شهر": [
+      {"form": "شَهْر", "ipa": "ʃæhɾ", "gloss": "city"},
+      {"form": "شِهْر", "ipa": "ʃehɾ", "gloss": "(rare) fame"}
+    ],
+    "بخش": [
+      {"form": "بَخْش", "ipa": "bæxʃ", "gloss": "section, part"},
+      {"form": "بِبَخْش", "ipa": "bebæxʃ", "gloss": "forgive (imperative)"}
+    ],
+    "سود": [
+      {"form": "سود", "ipa": "sud", "gloss": "profit, benefit"},
+      {"form": "سُود", "ipa": "sud", "gloss": "soda (loanword)"}
+    ],
+    "مست": [
+      {"form": "مَسْت", "ipa": "mæst", "gloss": "drunk, intoxicated"},
+      {"form": "مِسْت", "ipa": "mest", "gloss": "(dialectal) is"}
+    ],
+    "زر": [
+      {"form": "زَر", "ipa": "zæɾ", "gloss": "gold"},
+      {"form": "زِر", "ipa": "zeɾ", "gloss": "murmur, drivel"}
+    ],
+    "چند": [
+      {"form": "چَنْد", "ipa": "tʃænd", "gloss": "how many, several"},
+      {"form": "چُنْد", "ipa": "tʃond", "gloss": "(archaic) how much"}
+    ],
+    "کتب": [
+      {"form": "کُتُب", "ipa": "kotob", "gloss": "books (plural)"},
+      {"form": "کَتَب", "ipa": "kætæb", "gloss": "he wrote (Arabic)"}
+    ]
+  },
+  "ezafe_note": "Ezafe is NOT in this list because it is positional rather than lexical: a word-final kasra marking the genitive link. Handle it as its own track -- diacritics.ends_with_ezafe() detects it, and diacritics.mask(always_keep_ezafe=True) preserves it through masking. It is the highest-frequency audible prosodic error in Persian TTS and deserves its own eval set."
+}
