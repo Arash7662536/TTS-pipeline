@@ -15,6 +15,15 @@ manifest, emit a statistics report.
         --output /data/fidibo/manifest.jsonl --dataset-id 1 \
         --tier core --speaker-field narrator
 
+    # Arrow / HuggingFace `datasets` dataset (audio + text + whatever else).
+    # Look at the columns first, then point the field flags at them:
+    python -m persian_tts_frontend.cli inspect --input /data/fidibo/arrow
+    python -m persian_tts_frontend.cli normalize \
+        --input /data/fidibo/arrow --adapter arrow \
+        --text-field text --audio-field audio --speaker-field narrator \
+        --output /tmp/probe.jsonl --report /tmp/probe.json \
+        --limit 5000 --selftest
+
     # Common Voice (diversity tier)
     python -m persian_tts_frontend.cli normalize \
         --input /data/cv-fa/validated.tsv --adapter commonvoice \
@@ -30,6 +39,7 @@ Output rows carry the VoxCPM required fields plus provenance:
 
 import argparse
 import csv
+import glob
 import json
 import os
 import sys
@@ -125,13 +135,256 @@ def adapter_librispeech_style(path, audio_root=None, **kw):
                    "duration": None, "speaker": None, "_extra": {}}
 
 
+# ------------------------------------------------------------------- arrow
+
+# HuggingFace `Audio` columns are struct<bytes, path>; other exporters name the
+# path member differently. Checked in order.
+_AUDIO_PATH_KEYS = ("path", "filename", "file", "audio_path", "audio_filepath")
+
+
+def _stringy(pa, t):
+    return (pa.types.is_string(t) or pa.types.is_large_string(t)
+            or str(t) == "string_view")
+
+
+def _pyarrow():
+    try:
+        import pyarrow as pa
+    except ImportError:
+        raise SystemExit("the arrow adapter needs pyarrow -- "
+                         "pip install 'pyarrow>=12'")
+    return pa
+
+
+def arrow_fragments(path, split=None):
+    """Resolve `--input` into an ordered list of Arrow/Parquet files.
+
+    Accepts, in order of how you are likely to have the data:
+
+    * a `save_to_disk()` directory -- `data-00000-of-000NN.arrow` + `state.json`
+    * a `DatasetDict` directory -- pass `--split train` to pick one
+    * a `load_dataset()` cache directory under ~/.cache/huggingface/datasets
+    * a single `.arrow` or `.parquet` file
+    * a glob, e.g. `/data/shards/*.arrow`
+
+    Both Arrow IPC encodings are handled (file/Feather-v2 and the stream format
+    that `datasets` actually writes), so no `datasets` install is required.
+    """
+    if any(ch in path for ch in "*?["):
+        files = sorted(glob.glob(path))
+    elif os.path.isdir(path):
+        root = path
+        if split and os.path.isdir(os.path.join(path, split)):
+            root = os.path.join(path, split)
+        arrow, parquet = [], []
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames.sort()
+            for fn in sorted(filenames):
+                if fn.startswith("."):
+                    continue
+                if fn.endswith(".arrow"):
+                    arrow.append(os.path.join(dirpath, fn))
+                elif fn.endswith(".parquet"):
+                    parquet.append(os.path.join(dirpath, fn))
+        files = arrow or parquet
+        # A DatasetDict whose splits are not directories (dataset-train.arrow).
+        if split and root == path:
+            files = [f for f in files if split in os.path.relpath(f, path)]
+    else:
+        files = [path] if os.path.isfile(path) else []
+    if not files:
+        raise SystemExit(f"no .arrow/.parquet files found under {path!r}"
+                         + (f" for split {split!r}" if split else ""))
+    return files
+
+
+def _arrow_batches(pa, fp):
+    """Stream one file as RecordBatches. Memory-mapped: the audio bytes are
+    never faulted in unless something actually reads that column."""
+    if fp.endswith(".parquet"):
+        import pyarrow.parquet as pq
+        for b in pq.ParquetFile(fp).iter_batches(batch_size=1024):
+            yield b
+        return
+    with pa.memory_map(fp, "rb") as src:
+        try:
+            reader = pa.ipc.open_file(src)
+        except pa.ArrowInvalid:
+            src.seek(0)
+            for b in pa.ipc.open_stream(src):
+                yield b
+            return
+        for i in range(reader.num_record_batches):
+            yield reader.get_batch(i)
+
+
+def _arrow_schema(pa, fp):
+    if fp.endswith(".parquet"):
+        import pyarrow.parquet as pq
+        return pq.ParquetFile(fp).schema_arrow
+    with pa.memory_map(fp, "rb") as src:
+        try:
+            return pa.ipc.open_file(src).schema
+        except pa.ArrowInvalid:
+            src.seek(0)
+            return pa.ipc.open_stream(src).schema
+
+
+def _arrow_rows(pa, fp):
+    if fp.endswith(".parquet"):
+        import pyarrow.parquet as pq
+        return pq.ParquetFile(fp).metadata.num_rows
+    return sum(b.num_rows for b in _arrow_batches(pa, fp))
+
+
+def _field_names(pa, schema, prefix=""):
+    """Flat, dotted list of columns -- struct members included, so the error
+    message can suggest `--audio-field audio.path`."""
+    names = []
+    for f in schema:
+        names.append(prefix + f.name)
+        if pa.types.is_struct(f.type):
+            names.extend(_field_names(pa, f.type, prefix + f.name + "."))
+    return names
+
+
+def _column(pa, batch, dotted):
+    """Column by (possibly dotted) name, or None if it is not there."""
+    if not dotted:
+        return None
+    head, _, rest = dotted.partition(".")
+    if head not in batch.schema.names:
+        return None
+    arr = batch.column(batch.schema.names.index(head))
+    for part in filter(None, rest.split(".")):
+        if not pa.types.is_struct(arr.type):
+            return None
+        try:
+            arr = arr.field(part)
+        except (KeyError, IndexError):
+            return None
+    return arr
+
+
+def _audio_paths(pa, arr, n):
+    """Pull filesystem paths out of an audio column without touching the audio
+    bytes. Returns [None]*n when the column carries only embedded bytes."""
+    if arr is None:
+        return [None] * n
+    if pa.types.is_struct(arr.type):
+        members = [f.name for f in arr.type]
+        for key in _AUDIO_PATH_KEYS:
+            if key in members:
+                return arr.field(key).to_pylist()
+        return [None] * n
+    if pa.types.is_binary(arr.type) or pa.types.is_large_binary(arr.type):
+        return [None] * n
+    return arr.to_pylist()
+
+
+def _as_float(v):
+    try:
+        return float(v) or None
+    except (TypeError, ValueError):
+        return None
+
+
+def adapter_arrow(path, audio_root=None, text_field="text",
+                  audio_field="audio", speaker_field=None,
+                  duration_field="duration", split=None):
+    """Arrow / HuggingFace `datasets` dataset.
+
+    Only the columns named by the field flags are converted to Python, so a
+    dataset with megabytes of audio per row streams at the speed of its text
+    column. Rows whose audio is embedded (struct<bytes, path> with no path) get
+    a `<file>#row=N` locator instead of a path -- traceable, but do not pass
+    `--require-audio` for those.
+    """
+    pa = _pyarrow()
+    files = arrow_fragments(path, split=split)
+    # No upfront row count -- it would walk every shard's metadata before the
+    # first row, which defeats `--limit` on a big corpus. `inspect` counts.
+    print(f"arrow: {len(files)} file(s), first={files[0]}", file=sys.stderr)
+
+    warned = set()
+
+    def warn(key, msg):
+        if key not in warned:
+            warned.add(key)
+            print(f"!! {msg}", file=sys.stderr)
+
+    row_no = 0
+    for fp in files:
+        for batch in _arrow_batches(pa, fp):
+            n = batch.num_rows
+            if not n:
+                continue
+
+            texts = _column(pa, batch, text_field)
+            if texts is None:
+                raise SystemExit(
+                    f"--text-field {text_field!r} is not a column of this "
+                    f"dataset.\navailable: "
+                    + ", ".join(_field_names(pa, batch.schema))
+                    + "\n(run `cli inspect --input ...` to see the rows)")
+            texts = texts.to_pylist()
+
+            audio_col = _column(pa, batch, audio_field)
+            if audio_col is None and audio_field:
+                warn("audio", f"no {audio_field!r} column -- emitting "
+                              "'<file>#row=N' locators")
+            auds = _audio_paths(pa, audio_col, n)
+            if audio_col is not None and not any(auds):
+                warn("audio_bytes",
+                     f"{audio_field!r} carries embedded audio with no path -- "
+                     "emitting '<file>#row=N' locators; --require-audio will "
+                     "drop every row")
+
+            if speaker_field:
+                spk_col = _column(pa, batch, speaker_field)
+                if spk_col is None:
+                    warn("speaker", f"no {speaker_field!r} column -- speaker "
+                                    "stats will be empty")
+                spks = spk_col.to_pylist() if spk_col is not None else [None] * n
+            else:
+                spks = [None] * n
+
+            dur_col = _column(pa, batch, duration_field)
+            if dur_col is None and duration_field:
+                warn("duration", f"no {duration_field!r} column -- "
+                                 "speaker-hours will be empty")
+            durs = dur_col.to_pylist() if dur_col is not None else [None] * n
+
+            for k in range(n):
+                audio = auds[k] or ""
+                if audio and audio_root and not os.path.isabs(audio):
+                    audio = os.path.join(audio_root, audio)
+                if not audio:
+                    audio = f"{fp}#row={row_no + k}"
+                text = texts[k]
+                spk = spks[k]
+                yield {
+                    "audio": audio,
+                    "text": text if isinstance(text, str) else
+                            ("" if text is None else str(text)),
+                    "duration": _as_float(durs[k]),
+                    "speaker": None if spk is None else str(spk),
+                    "_extra": {},
+                }
+            row_no += n
+
+
 ADAPTERS = {
     "jsonl": adapter_jsonl,
     "csv": adapter_csv,
     "tsv": lambda *a, **k: adapter_csv(*a, delimiter="\t", **k),
     "commonvoice": adapter_commonvoice,
     "trans": adapter_librispeech_style,
+    "arrow": adapter_arrow,
+    "parquet": adapter_arrow,      # same reader; resolved by file suffix
 }
+
+FIELD_AWARE = {"jsonl", "csv", "tsv", "arrow", "parquet"}
 
 
 # ------------------------------------------------------------------ main pass
@@ -148,10 +401,12 @@ def run_normalize(args):
 
     adapter = ADAPTERS[args.adapter]
     kwargs = dict(audio_root=args.audio_root)
-    if args.adapter in ("jsonl", "csv", "tsv"):
+    if args.adapter in FIELD_AWARE:
         kwargs.update(text_field=args.text_field, audio_field=args.audio_field,
                       speaker_field=args.speaker_field,
                       duration_field=args.duration_field)
+    if args.adapter in ("arrow", "parquet"):
+        kwargs.update(split=args.split)
     rows = adapter(args.input, **kwargs)
 
     stats = Counter()
@@ -287,6 +542,65 @@ def run_normalize(args):
     return 0
 
 
+def run_inspect(args):
+    """Print the schema of an Arrow/Parquet dataset plus a few rows, so you know
+    what to give `--text-field` / `--audio-field` / `--speaker-field`."""
+    pa = _pyarrow()
+    files = arrow_fragments(args.input, split=args.split)
+
+    print(f"{len(files)} file(s):")
+    for f in files[:8]:
+        print("  " + f)
+    if len(files) > 8:
+        print(f"  ... +{len(files) - 8} more")
+
+    schema = _arrow_schema(pa, files[0])
+    print("\ncolumns:")
+    for f in schema:
+        print(f"  {f.name:<28} {f.type}")
+        if pa.types.is_struct(f.type):
+            for sub in f.type:
+                hint = ("   (usable as --audio-field "
+                        f"{f.name}.{sub.name})") if _stringy(pa, sub.type) else ""
+                print(f"    .{sub.name:<25} {sub.type}{hint}")
+
+    print(f"\nrows: {sum(_arrow_rows(pa, f) for f in files)}")
+
+    if args.rows:
+        print(f"\nfirst {args.rows} row(s):")
+        shown = 0
+        for batch in _arrow_batches(pa, files[0]):
+            for i in range(batch.num_rows):
+                if shown >= args.rows:
+                    break
+                row = {name: _cell(pa, batch.column(j), i)
+                       for j, name in enumerate(batch.schema.names)}
+                print("  " + json.dumps(row, ensure_ascii=False))
+                shown += 1
+            if shown >= args.rows:
+                break
+    return 0
+
+
+def _cell(pa, arr, i):
+    """One value, rendered for human eyes -- blobs and waveforms summarised
+    rather than dumped."""
+    t = arr.type
+    if pa.types.is_struct(t):
+        return {f.name: _cell(pa, arr.field(f.name), i) for f in t}
+    if pa.types.is_binary(t) or pa.types.is_large_binary(t):
+        v = arr[i].as_py()
+        return None if v is None else f"<binary {len(v)} bytes>"
+    if (pa.types.is_list(t) or pa.types.is_large_list(t)
+            or pa.types.is_fixed_size_list(t)):
+        s = arr[i]
+        return None if not s.is_valid else f"<list len={len(s)}>"
+    v = arr[i].as_py()
+    if isinstance(v, str) and len(v) > 160:
+        return v[:160] + f"... (+{len(v) - 160} chars)"
+    return v if isinstance(v, (str, int, float, bool, type(None))) else str(v)
+
+
 def _skew(counts):
     """Crude concentration measure: share of rows held by the top 10% of
     speakers. Above ~0.5 means you need the per-narrator cap."""
@@ -304,8 +618,11 @@ def main(argv=None):
     sub = p.add_subparsers(dest="cmd", required=True)
 
     n = sub.add_parser("normalize", help="normalize a corpus into a manifest")
-    n.add_argument("--input", required=True)
+    n.add_argument("--input", required=True,
+                   help="file, glob, or (arrow/parquet) dataset directory")
     n.add_argument("--adapter", default="jsonl", choices=sorted(ADAPTERS))
+    n.add_argument("--split", default=None,
+                   help="arrow/parquet only: pick one split of a DatasetDict")
     n.add_argument("--output", default=None)
     n.add_argument("--report", default=None)
     n.add_argument("--audio-root", default=None)
@@ -331,6 +648,14 @@ def main(argv=None):
     n.add_argument("--no-provenance", action="store_true")
     n.add_argument("--selftest", action="store_true")
     n.set_defaults(func=run_normalize)
+
+    q = sub.add_parser("inspect",
+                       help="show the schema + first rows of an arrow/parquet "
+                            "dataset")
+    q.add_argument("--input", required=True)
+    q.add_argument("--split", default=None)
+    q.add_argument("--rows", type=int, default=3)
+    q.set_defaults(func=run_inspect)
 
     a = p.parse_args(argv)
     return a.func(a)

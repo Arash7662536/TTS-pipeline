@@ -7,10 +7,11 @@ name = "persian-tts-frontend"
 version = "1.0.0"
 description = "Persian text normalization frontend for VoxCPM 2 fine-tuning"
 requires-python = ">=3.9"
-dependencies = []          # stdlib only; transformers needed only for scripts/run_audit.py
+dependencies = []          # stdlib only; the extras below are per-command
 
 [project.optional-dependencies]
-audit = ["transformers>=4.40"]
+audit = ["transformers>=4.40"]        # scripts/run_audit.py
+arrow = ["pyarrow>=12"]               # cli --adapter arrow|parquet, cli inspect
 
 [tool.setuptools]
 packages = ["persian_tts_frontend"]

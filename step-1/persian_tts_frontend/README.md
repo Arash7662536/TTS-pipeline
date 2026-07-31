@@ -63,9 +63,41 @@ python -m persian_tts_frontend.cli normalize \
     --output /data/manifests/cv.jsonl --dataset-id 3 --tier diversity
 ```
 
-Adapters: `jsonl`, `csv`, `tsv`, `commonvoice`, `trans` (LibriSpeech-style
-`{utt_id} {transcript}` lines). For thomclas, use `jsonl`/`csv`/`tsv` with
-`--text-field` / `--audio-field` / `--speaker-field` pointed at its columns.
+Adapters: `jsonl`, `csv`, `tsv`, `arrow`, `parquet`, `commonvoice`, `trans`
+(LibriSpeech-style `{utt_id} {transcript}` lines). For thomclas, use
+`jsonl`/`csv`/`tsv`/`arrow` with `--text-field` / `--audio-field` /
+`--speaker-field` pointed at its columns.
+
+### Arrow / HuggingFace `datasets` input
+
+```bash
+# 0. what are the columns actually called?
+python -m persian_tts_frontend.cli inspect --input /data/fidibo/arrow --rows 3
+
+# 1. dry run
+python -m persian_tts_frontend.cli normalize \
+    --input /data/fidibo/arrow --adapter arrow \
+    --text-field text --audio-field audio --speaker-field narrator \
+    --output /tmp/probe.jsonl --report /tmp/probe.json \
+    --limit 5000 --selftest
+```
+
+`--input` takes a `save_to_disk()` directory, a `DatasetDict` directory
+(add `--split train`), a `load_dataset()` cache directory, a single
+`.arrow`/`.parquet` file, or a glob. Both Arrow IPC encodings are handled — the
+stream encoding `datasets` writes, and the file/Feather-v2 encoding — so only
+`pyarrow` is needed, not `datasets` (`pip install 'persian-tts-frontend[arrow]'`).
+
+Files are memory-mapped and **only the columns you name are converted to
+Python**, so the audio payload is never faulted in: a 300 MB dataset normalizes
+at ~75 MB RSS. Dotted names reach into structs (`--audio-field audio.path`).
+
+An `audio` column of `struct<bytes, path>` with a null `path` — i.e. audio
+embedded in the Arrow file, with no file on disk — yields a
+`<file>#row=N` locator in the manifest instead of a path. Those rows are
+traceable but not openable, so **do not pass `--require-audio`**; extract the
+clips first (`datasets` → `cast_column("audio", Audio(decode=False))` and write
+them out) if the trainer needs real files.
 
 ### Read these four numbers in the report before proceeding
 
@@ -225,7 +257,7 @@ persian_tts_frontend/
   diacritics.py   strip/mask/validate, MaskingSchedule, STAGE_B_DENSITY_MIX
   pipeline.py     Normalizer, config, version hash, selftest
   audit.py        roundtrip, fertility, cost curve, clip survival
-  cli.py          dataset adapters + manifest builder + report
+  cli.py          dataset adapters (jsonl/csv/arrow/...) + manifest + report
 data/
   homographs_seed.json    ~57 entries with diacritized readings and glosses
 scripts/run_audit.py

@@ -248,6 +248,75 @@ def test_latin_resolution():
           "transliterate leaves no Latin", nz3("برند Sharp"), "no ascii")
 
 
+# -------------------------------------------------------------- arrow adapter
+
+def test_arrow_adapter():
+    """Skipped when pyarrow is absent -- the rest of the package is stdlib."""
+    try:
+        import pyarrow as pa
+    except ImportError:
+        return
+    import tempfile
+    from persian_tts_frontend.cli import adapter_arrow, arrow_fragments
+
+    audio_t = pa.struct([("bytes", pa.binary()), ("path", pa.string())])
+    rows = ["در سال ۱۴۰۳ رشد داشت", "قیمت ۱۲٫۵ میلیون تومان"]
+
+    def tbl(with_path):
+        return pa.table({
+            "audio": pa.array(
+                [{"bytes": b"RIFF", "path": f"c/{i}.wav" if with_path else None}
+                 for i in range(len(rows))], type=audio_t),
+            "text": pa.array(rows, type=pa.large_string()),
+            "narrator": pa.array(["spk_a", "spk_b"]),
+            "duration": pa.array([1.5, 2.5], type=pa.float64()),
+        })
+
+    with tempfile.TemporaryDirectory() as d:
+        # `datasets.save_to_disk` writes the IPC *stream* encoding ...
+        stream = Path(d) / "ds"
+        stream.mkdir()
+        with pa.OSFile(str(stream / "data-00000-of-00001.arrow"), "wb") as sink:
+            w = pa.ipc.new_stream(sink, tbl(True).schema)
+            w.write_table(tbl(True))
+            w.close()
+        # ... while `Table.to_file`/Feather writes the file encoding.
+        with pa.OSFile(str(Path(d) / "one.arrow"), "wb") as sink:
+            w = pa.ipc.new_file(sink, tbl(False).schema)
+            w.write_table(tbl(False))
+            w.close()
+
+        eq(len(arrow_fragments(str(stream))), 1, "arrow: dir -> 1 fragment")
+
+        got = list(adapter_arrow(str(stream), speaker_field="narrator"))
+        eq(len(got), 2, "arrow stream: row count")
+        eq(got[0]["text"], rows[0], "arrow stream: text")
+        eq(got[0]["audio"], "c/0.wav", "arrow stream: audio path")
+        eq(got[1]["speaker"], "spk_b", "arrow stream: speaker")
+        eq(got[0]["duration"], 1.5, "arrow stream: duration")
+
+        rooted = list(adapter_arrow(str(stream), audio_root="/mnt/wav"))
+        eq(rooted[0]["audio"], "/mnt/wav/c/0.wav", "arrow: audio_root joined")
+
+        # file encoding + audio with bytes but no path -> row locator
+        bytesonly = list(adapter_arrow(str(Path(d) / "one.arrow")))
+        eq(len(bytesonly), 2, "arrow file encoding: row count")
+        check(bytesonly[1]["audio"].endswith("one.arrow#row=1"),
+              "arrow: embedded audio gets a row locator",
+              bytesonly[1]["audio"], "*one.arrow#row=1")
+
+        # nested field access, and a bad field name must not pass silently
+        nested = list(adapter_arrow(str(stream), audio_field="audio.path"))
+        eq(nested[0]["audio"], "c/0.wav", "arrow: dotted --audio-field")
+        try:
+            list(adapter_arrow(str(stream), text_field="nope"))
+            check(False, "arrow: unknown --text-field raises")
+        except SystemExit as e:
+            check("nope" in str(e) and "narrator" in str(e),
+                  "arrow: unknown --text-field lists the real columns", str(e),
+                  "message naming the available columns")
+
+
 # ------------------------------------------------------------------ runner
 
 def main():
