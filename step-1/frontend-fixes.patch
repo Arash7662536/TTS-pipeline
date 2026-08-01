@@ -1,6 +1,6 @@
 diff -urN orig/persian_tts_frontend/cli.py new/persian_tts_frontend/cli.py
 --- a/persian_tts_frontend/cli.py	2026-07-31 16:14:05.000000000 +0100
-+++ b/persian_tts_frontend/cli.py	2026-08-01 15:47:02.312692188 +0100
++++ b/persian_tts_frontend/cli.py	2026-08-01 16:57:10.608217425 +0100
 @@ -15,6 +15,15 @@
          --output /data/fidibo/manifest.jsonl --dataset-id 1 \
          --tier core --speaker-field narrator
@@ -378,7 +378,7 @@ diff -urN orig/persian_tts_frontend/cli.py new/persian_tts_frontend/cli.py
      rows = adapter(args.input, **kwargs)
  
      stats = Counter()
-@@ -162,6 +494,10 @@
+@@ -162,8 +494,13 @@
      densities = []
      samples_for_selftest = []
      dropped_examples = []
@@ -388,8 +388,11 @@ diff -urN orig/persian_tts_frontend/cli.py new/persian_tts_frontend/cli.py
 +    field_values = defaultdict(list)
  
      out = open(args.output, "w", encoding="utf-8") if args.output else None
++    arrow_out = ArrowManifestWriter(args.output_arrow) if args.output_arrow else None
      try:
-@@ -178,6 +514,29 @@
+         for i, r in enumerate(rows):
+             if args.limit and i >= args.limit:
+@@ -178,6 +515,29 @@
                  stats["drop_empty_source"] += 1
                  continue
  
@@ -419,7 +422,7 @@ diff -urN orig/persian_tts_frontend/cli.py new/persian_tts_frontend/cli.py
              res = nz.normalize(raw)
  
              if len(samples_for_selftest) < 2000:
-@@ -203,6 +562,20 @@
+@@ -203,6 +563,20 @@
                      dropped_examples.append({"reason": "too_long",
                                               "chars": len(res.text)})
                  continue
@@ -440,7 +443,7 @@ diff -urN orig/persian_tts_frontend/cli.py new/persian_tts_frontend/cli.py
              if args.require_audio and not os.path.exists(r["audio"]):
                  stats["drop_missing_audio"] += 1
                  if len(dropped_examples) < 10:
-@@ -212,16 +585,22 @@
+@@ -212,16 +586,22 @@
  
              stats["kept"] += 1
              densities.append(res.diacritic_density)
@@ -458,7 +461,8 @@ diff -urN orig/persian_tts_frontend/cli.py new/persian_tts_frontend/cli.py
 +                if dur:
 +                    speaker_seconds[spk] += dur
  
-             if out:
+-            if out:
++            if out or arrow_out is not None:
                  row = {"audio": r["audio"], "text": res.text}
 -                if r.get("duration"):
 -                    row["duration"] = round(float(r["duration"]), 3)
@@ -467,18 +471,29 @@ diff -urN orig/persian_tts_frontend/cli.py new/persian_tts_frontend/cli.py
                  row["dataset_id"] = args.dataset_id
                  if not args.no_provenance:
                      row["text_raw"] = raw
-@@ -230,6 +609,10 @@
+@@ -230,10 +610,20 @@
                      row["diacritic_density"] = round(res.diacritic_density, 4)
                      if spk:
                          row["speaker"] = spk
+-                out.write(json.dumps(row, ensure_ascii=False) + "\n")
 +                for name in keep_fields:
 +                    if name in extra and extra[name] is not None:
 +                        v = extra[name]
 +                        row[name] = round(v, 4) if isinstance(v, float) else v
-                 out.write(json.dumps(row, ensure_ascii=False) + "\n")
++                if out:
++                    out.write(json.dumps(row, ensure_ascii=False) + "\n")
++            if arrow_out is not None:
++                arrow_out.write(row)
      finally:
          if out:
-@@ -264,6 +647,14 @@
+             out.close()
++        if arrow_out is not None:
++            n_rows, cols = arrow_out.close()
++            print(f"arrow manifest: {n_rows} rows -> {args.output_arrow}\n  columns: {', '.join(cols)}", file=sys.stderr)
+ 
+     # ------------------------------------------------------------ the report
+     rep = {
+@@ -264,6 +654,14 @@
          "dropped_examples": dropped_examples,
      }
  
@@ -493,10 +508,344 @@ diff -urN orig/persian_tts_frontend/cli.py new/persian_tts_frontend/cli.py
      if args.selftest:
          rep["selftest_failures"] = {
              k: (len(v), v[:5]) for k, v in
-@@ -287,6 +678,112 @@
+@@ -287,6 +685,446 @@
      return 0
  
  
++def run_try(args):
++    """Normalize sentences given on the command line or on stdin, and show what
++    the frontend did to them. This is the thing to reach for before trusting a
++    corpus pass -- it is the same Normalizer, same config, same version."""
++    cfg = NormalizerConfig(
++        keep_harakat=not args.strip_harakat,
++        decimal_style=args.decimal_style,
++        latin_strategy=args.latin_strategy,
++        parens_to_commas=not args.keep_parens,
++    )
++    nz = Normalizer(config=cfg)
++
++    if args.text:
++        lines = list(args.text)
++    else:
++        lines = [ln.rstrip("\n") for ln in sys.stdin if ln.strip()]
++    if not lines:
++        raise SystemExit("nothing to normalize -- pass sentences as arguments "
++                         "or pipe them on stdin")
++
++    print(f"frontend version: {nz.version}", file=sys.stderr)
++    for i, raw in enumerate(lines):
++        if i:
++            print()
++        r = nz.normalize(raw)
++        print(f"  in   {raw}")
++        print(f"  out  {r.text}")
++        notes = [f"{r.n_words} words",
++                 f"diacritic_density={r.diacritic_density:.3f}"]
++        if not r.changed:
++            notes.append("unchanged")
++        if nz(r.text) != r.text:
++            notes.append("NOT IDEMPOTENT")
++        print("       " + ", ".join(notes))
++        if r.unexpected:
++            print("       stripped: " + " ".join(
++                f"U+{ord(c):04X} {c!r}" for c in r.unexpected))
++        if r.problems:
++            print("       diacritic problems: " + ", ".join(r.problems))
++        esc = re.findall(r"\{[^{}]*\}", r.text)
++        if esc:
++            print("       unresolved Latin: " + " ".join(esc))
++    if nz.latin.unknown:
++        print("\nnot in the lexicon: "
++              + ", ".join(t for t, _ in nz.latin.work_queue(20)),
++              file=sys.stderr)
++    return 0
++
++
++class ArrowManifestWriter:
++    """Write manifest rows as an Arrow IPC stream, readable by
++    `datasets.Dataset.from_file()` and by `pyarrow.ipc.open_stream`.
++
++    Rows are buffered because the column set is not known up front -- `duration`
++    and the `--keep-fields` columns are per-row optional -- so the schema is the
++    union of every key emitted. A manifest is text plus a handful of scalars, so
++    this stays small next to the audio it points at.
++    """
++
++    def __init__(self, path):
++        self.pa = _pyarrow()
++        self.path = path
++        self.rows = []
++
++    def write(self, row):
++        self.rows.append(row)
++
++    def close(self):
++        pa = self.pa
++        keys = []
++        for r in self.rows:
++            for k in r:
++                if k not in keys:
++                    keys.append(k)
++        table = pa.Table.from_pydict(
++            {k: [r.get(k) for r in self.rows] for k in keys})
++        with pa.OSFile(self.path, "wb") as sink:
++            w = pa.ipc.new_stream(sink, table.schema)
++            w.write_table(table)
++            w.close()
++        return len(self.rows), keys
++
++
++def run_build(args):
++    """Write a self-contained Arrow dataset: the source audio carried through
++    untouched, the transcript replaced by its normalized form.
++
++    Unlike `normalize`, which emits a manifest of pointers, this reproduces the
++    corpus. The audio never becomes a Python object -- rows are selected with
++    an Arrow `take`, so the payload moves buffer-to-buffer and peak memory stays
++    at roughly one source batch regardless of corpus size.
++
++    The result is a `save_to_disk()` layout: `datasets.load_from_disk()` reads
++    it directly, with `audio` still typed as `Audio(sampling_rate=...)`.
++    """
++    pa = _pyarrow()
++    cfg = NormalizerConfig(
++        keep_harakat=not args.strip_harakat,
++        decimal_style=args.decimal_style,
++        latin_strategy=args.latin_strategy,
++        parens_to_commas=not args.keep_parens,
++    )
++    nz = Normalizer(config=cfg)
++    print(f"frontend version: {nz.version}", file=sys.stderr)
++
++    bounds = _parse_bounds(args.min_field, args.max_field)
++    keep_fields = [f for f in (args.keep_fields or "").split(",") if f]
++    wanted = list(dict.fromkeys(keep_fields + list(bounds)))
++    drop_re = re.compile(args.drop_text_matching) if args.drop_text_matching else None
++
++    files = arrow_fragments(args.input, split=args.split)
++    outdir = args.output_dataset
++    os.makedirs(outdir, exist_ok=True)
++    for stale in glob.glob(os.path.join(outdir, "data-*.arrow")):
++        os.remove(stale)
++
++    stats = Counter()
++    densities = []
++    durations = []
++    shard_lengths = []
++    schema = [None]
++    writer = {"w": None, "sink": None, "rows": 0, "bytes": 0, "n": 0}
++    shard_bytes = args.shard_mb * 1024 * 1024
++
++    def open_shard():
++        path = os.path.join(outdir, f"data-{writer['n']:05d}.arrow")
++        writer["sink"] = pa.OSFile(path, "wb")
++        writer["w"] = pa.ipc.new_stream(writer["sink"], schema[0])
++        writer["rows"] = 0
++        writer["bytes"] = 0
++
++    def close_shard():
++        if writer["w"] is None:
++            return
++        writer["w"].close()
++        writer["sink"].close()
++        shard_lengths.append(writer["rows"])
++        writer["w"] = None
++        writer["n"] += 1
++
++    for fp in files:
++        for batch in _arrow_batches(pa, fp):
++            n = batch.num_rows
++            if not n:
++                continue
++
++            texts = _column(pa, batch, args.text_field)
++            if texts is None:
++                raise SystemExit(
++                    f"--text-field {args.text_field!r} is not a column.\n"
++                    "available: " + ", ".join(_field_names(pa, batch.schema)))
++            texts = texts.to_pylist()
++
++            audio_col = _column(pa, batch, args.audio_field)
++            if audio_col is None:
++                raise SystemExit(
++                    f"--audio-field {args.audio_field!r} is not a column.\n"
++                    "available: " + ", ".join(_field_names(pa, batch.schema)))
++
++            dur_col = _column(pa, batch, args.duration_field)
++            if dur_col is not None:
++                durs = dur_col.to_pylist()
++            elif args.duration_from_audio:
++                durs = _audio_durations(pa, audio_col, n)
++            else:
++                durs = [None] * n
++
++            extras = {}
++            for name in wanted:
++                col = _column(pa, batch, name)
++                if col is not None:
++                    extras[name] = col.to_pylist()
++
++            keep, norm_text, raw_text, keep_dur, keep_dens = [], [], [], [], []
++            for k in range(n):
++                stats["read"] += 1
++                raw = (texts[k] or "").strip()
++                if not raw:
++                    stats["drop_empty_source"] += 1
++                    continue
++                if drop_re is not None and drop_re.search(raw):
++                    stats["drop_text_pattern"] += 1
++                    continue
++                gated = False
++                for name, (lo, hi) in bounds.items():
++                    v = _as_number(extras.get(name, [None] * n)[k])
++                    if v is None:
++                        stats[f"drop_{name}_missing"] += 1
++                        gated = True
++                        break
++                    if (lo is not None and v < lo) or (hi is not None and v > hi):
++                        stats[f"drop_{name}_out_of_range"] += 1
++                        gated = True
++                        break
++                if gated:
++                    continue
++                d = _as_float(durs[k])
++                if args.min_duration or args.max_duration:
++                    if d is None:
++                        stats["drop_duration_unknown"] += 1
++                        continue
++                    if args.min_duration and d < args.min_duration:
++                        stats["drop_too_short_audio"] += 1
++                        continue
++                    if args.max_duration and d > args.max_duration:
++                        stats["drop_too_long_audio"] += 1
++                        continue
++
++                res = nz.normalize(raw)
++                if not res.text.strip():
++                    stats["drop_empty_after_norm"] += 1
++                    continue
++                if args.min_words and res.n_words < args.min_words:
++                    stats["drop_too_short"] += 1
++                    continue
++                if args.max_chars and len(res.text) > args.max_chars:
++                    stats["drop_too_long"] += 1
++                    continue
++
++                stats["kept"] += 1
++                keep.append(k)
++                norm_text.append(res.text)
++                raw_text.append(raw)
++                keep_dur.append(d)
++                keep_dens.append(round(res.diacritic_density, 4))
++                densities.append(res.diacritic_density)
++                if d:
++                    durations.append(d)
++
++            if not keep:
++                continue
++
++            idx = pa.array(keep, type=pa.int32())
++            cols = {
++                "audio": audio_col.take(idx),          # buffers, not Python
++                "text": pa.array(norm_text, type=pa.string()),
++                "text_raw": pa.array(raw_text, type=pa.string()),
++                "duration": pa.array(keep_dur, type=pa.float64()),
++                "dataset_id": pa.array([args.dataset_id] * len(keep),
++                                       type=pa.int64()),
++                "tier": pa.array([args.tier] * len(keep), type=pa.string()),
++                "norm_version": pa.array([nz.version] * len(keep),
++                                         type=pa.string()),
++                "diacritic_density": pa.array(keep_dens, type=pa.float64()),
++            }
++            for name in keep_fields:
++                if name in extras:
++                    cols[name] = pa.array([extras[name][k] for k in keep],
++                                          type=pa.float64())
++
++            if schema[0] is None:
++                schema[0] = _hf_schema(pa, cols, args.sampling_rate)
++            rb = pa.RecordBatch.from_arrays(list(cols.values()),
++                                            schema=schema[0])
++            if writer["w"] is None:
++                open_shard()
++            writer["w"].write_batch(rb)
++            writer["rows"] += rb.num_rows
++            writer["bytes"] += rb.nbytes
++            if writer["bytes"] >= shard_bytes:
++                close_shard()
++    close_shard()
++
++    if not shard_lengths:
++        raise SystemExit("no rows survived the filters -- nothing written")
++
++    total = sum(shard_lengths)
++    _write_hf_metadata(outdir, schema[0], shard_lengths, total, args.split or "train")
++
++    rep = {
++        "frontend_version": nz.version,
++        "counts": dict(stats),
++        "keep_rate": round(stats["kept"] / max(1, stats["read"]), 4),
++        "shards": len(shard_lengths),
++        "rows": total,
++        "diacritic_density": {
++            "mean": round(sum(densities) / max(1, len(densities)), 4)},
++    }
++    if durations:
++        rep["audio_duration"] = dict(
++            _quantiles(durations),
++            total_hours=round(sum(durations) / 3600, 2))
++    txt = json.dumps(rep, indent=2, ensure_ascii=False)
++    if args.report:
++        with open(args.report, "w", encoding="utf-8") as f:
++            f.write(txt)
++    print(txt)
++    print(f"\ndataset: {total} rows in {len(shard_lengths)} shard(s) -> {outdir}",
++          file=sys.stderr)
++    return 0
++
++
++def _hf_schema(pa, cols, sampling_rate):
++    """Arrow schema carrying the `datasets` feature block, so `audio` comes back
++    as an Audio column rather than a raw struct."""
++    features = {}
++    for name, arr in cols.items():
++        if name == "audio":
++            features[name] = {"sampling_rate": sampling_rate, "_type": "Audio"}
++        elif pa.types.is_string(arr.type):
++            features[name] = {"dtype": "string", "_type": "Value"}
++        elif pa.types.is_int64(arr.type):
++            features[name] = {"dtype": "int64", "_type": "Value"}
++        else:
++            features[name] = {"dtype": "float64", "_type": "Value"}
++    schema = pa.schema([(n, a.type) for n, a in cols.items()])
++    return schema.with_metadata({
++        "huggingface": json.dumps({"info": {"features": features}})})
++
++
++def _write_hf_metadata(outdir, schema, shard_lengths, total, split):
++    features = json.loads(
++        schema.metadata[b"huggingface"].decode())["info"]["features"]
++    with open(os.path.join(outdir, "dataset_info.json"), "w",
++              encoding="utf-8") as f:
++        json.dump({"builder_name": "persian_tts_frontend", "config_name":
++                   "default", "dataset_name": "persian_tts_frontend",
++                   "description": "", "citation": "", "homepage": "",
++                   "license": "", "features": features,
++                   "splits": {split: {"name": split, "num_examples": total,
++                                      "shard_lengths": shard_lengths,
++                                      "dataset_name": "persian_tts_frontend"}},
++                   "version": {"version_str": "1.0.0", "major": 1, "minor": 0,
++                               "patch": 0}},
++                  f, ensure_ascii=False, indent=2)
++    with open(os.path.join(outdir, "state.json"), "w", encoding="utf-8") as f:
++        json.dump({"_data_files": [{"filename": f"data-{i:05d}.arrow"}
++                                   for i in range(len(shard_lengths))],
++                   "_fingerprint": "ptf" + "%012x" % (total * 2654435761 % 2**48),
++                   "_format_columns": None, "_format_kwargs": {},
++                   "_format_type": None, "_output_all_columns": False,
++                   "_split": split}, f, ensure_ascii=False, indent=2)
++
++
 +def run_inspect(args):
 +    """Print the schema of an Arrow/Parquet dataset plus a few rows, so you know
 +    what to give `--text-field` / `--audio-field` / `--speaker-field`."""
@@ -606,7 +955,7 @@ diff -urN orig/persian_tts_frontend/cli.py new/persian_tts_frontend/cli.py
  def _skew(counts):
      """Crude concentration measure: share of rows held by the top 10% of
      speakers. Above ~0.5 means you need the per-narrator cap."""
-@@ -304,8 +801,11 @@
+@@ -304,10 +1142,16 @@
      sub = p.add_subparsers(dest="cmd", required=True)
  
      n = sub.add_parser("normalize", help="normalize a corpus into a manifest")
@@ -618,8 +967,13 @@ diff -urN orig/persian_tts_frontend/cli.py new/persian_tts_frontend/cli.py
 +                   help="arrow/parquet only: pick one split of a DatasetDict")
      n.add_argument("--output", default=None)
      n.add_argument("--report", default=None)
++    n.add_argument("--output-arrow", default=None, metavar="PATH",
++                   help="also write the manifest as an Arrow IPC "
++                        "stream (datasets.Dataset.from_file)")
      n.add_argument("--audio-root", default=None)
-@@ -322,16 +822,40 @@
+     n.add_argument("--text-field", default="text")
+     n.add_argument("--audio-field", default="audio")
+@@ -322,16 +1166,86 @@
      n.add_argument("--min-words", type=int, default=2)
      n.add_argument("--max-chars", type=int, default=600)
      n.add_argument("--require-audio", action="store_true")
@@ -649,6 +1003,52 @@ diff -urN orig/persian_tts_frontend/cli.py new/persian_tts_frontend/cli.py
      n.add_argument("--selftest", action="store_true")
      n.set_defaults(func=run_normalize)
  
++    b = sub.add_parser("build", help="write a full Arrow dataset: source audio "
++                                     "carried through, text normalized")
++    b.add_argument("--input", required=True)
++    b.add_argument("--output-dataset", required=True, metavar="DIR",
++                   help="save_to_disk() layout; load_from_disk() reads it")
++    b.add_argument("--report", default=None)
++    b.add_argument("--split", default=None)
++    b.add_argument("--text-field", default="text")
++    b.add_argument("--audio-field", default="audio")
++    b.add_argument("--duration-field", default="duration")
++    b.add_argument("--duration-from-audio", action="store_true")
++    b.add_argument("--sampling-rate", type=int, default=16000,
++                   help="declared on the Audio feature; must match the audio")
++    b.add_argument("--shard-mb", type=int, default=500,
++                   help="roll a new shard past this many MB (default 500)")
++    b.add_argument("--keep-fields", default=None, metavar="A,B")
++    b.add_argument("--min-field", action="append", default=[], metavar="NAME=V")
++    b.add_argument("--max-field", action="append", default=[], metavar="NAME=V")
++    b.add_argument("--drop-text-matching", default=None, metavar="REGEX")
++    b.add_argument("--min-duration", type=float, default=0.0, metavar="SEC")
++    b.add_argument("--max-duration", type=float, default=0.0, metavar="SEC")
++    b.add_argument("--min-words", type=int, default=2)
++    b.add_argument("--max-chars", type=int, default=600)
++    b.add_argument("--dataset-id", type=int, default=0)
++    b.add_argument("--tier", default="core",
++                   choices=["gold", "core", "diversity", "register",
++                            "emotion", "replay"])
++    b.add_argument("--strip-harakat", action="store_true")
++    b.add_argument("--keep-parens", action="store_true")
++    b.add_argument("--decimal-style", default="momayez",
++                   choices=["momayez", "fractional"])
++    b.add_argument("--latin-strategy", default="escalate",
++                   choices=["escalate", "lexicon", "transliterate"])
++    b.set_defaults(func=run_build)
++
++    t = sub.add_parser("try", help="normalize sentences from the command line "
++                                   "or stdin and show what changed")
++    t.add_argument("text", nargs="*", help="sentences; omit to read stdin")
++    t.add_argument("--strip-harakat", action="store_true")
++    t.add_argument("--keep-parens", action="store_true")
++    t.add_argument("--decimal-style", default="momayez",
++                   choices=["momayez", "fractional"])
++    t.add_argument("--latin-strategy", default="escalate",
++                   choices=["escalate", "lexicon", "transliterate"])
++    t.set_defaults(func=run_try)
++
 +    q = sub.add_parser("inspect",
 +                       help="show the schema + first rows of an arrow/parquet "
 +                            "dataset")
@@ -662,7 +1062,7 @@ diff -urN orig/persian_tts_frontend/cli.py new/persian_tts_frontend/cli.py
  
 diff -urN orig/persian_tts_frontend/expand.py new/persian_tts_frontend/expand.py
 --- a/persian_tts_frontend/expand.py	2026-07-31 16:14:05.000000000 +0100
-+++ b/persian_tts_frontend/expand.py	2026-08-01 15:47:02.312692188 +0100
++++ b/persian_tts_frontend/expand.py	2026-08-01 16:57:10.608217425 +0100
 @@ -9,7 +9,8 @@
  import re
  
@@ -746,10 +1146,76 @@ diff -urN orig/persian_tts_frontend/expand.py new/persian_tts_frontend/expand.py
          "time": expand_time,
          "dates": expand_dates,
          "phone": expand_phone,
+diff -urN orig/persian_tts_frontend/latin.py new/persian_tts_frontend/latin.py
+--- a/persian_tts_frontend/latin.py	2026-07-31 16:14:05.000000000 +0100
++++ b/persian_tts_frontend/latin.py	2026-08-01 16:57:10.608217425 +0100
+@@ -52,6 +52,40 @@
+     "id": "آی‌دی", "url": "یو‌آر‌ال", "pdf": "پی‌دی‌اف",
+ }
+ 
++#: Corpus-derived additions, ranked from the thomclas `unknown` counter (2317
++#: distinct tokens / 7710 occurrences over 109k rows). These are the head of
++#: that distribution -- the ~90 entries below cover roughly a quarter of all
++#: unresolved word occurrences, and they are the ones the crude transliterator
++#: mangles worst ("the" -> "ت"). A native speaker should review the readings.
++LEXICON.update({
++    "the": "د", "of": "آو", "and": "اند", "in": "این", "to": "تو",
++    "on": "آن", "is": "ایز", "it": "ایت", "if": "ایف", "we": "وی",
++    "out": "اوت", "off": "آف", "per": "پر", "see": "سی", "what": "وات",
++    "deal": "دیل", "new": "نیو", "value": "ولیو", "war": "وار",
++    "great": "گریت", "work": "ورک", "state": "استیت", "junk": "جانک",
++    "people": "پیپل", "good": "گود", "deep": "دیپ", "world": "ورلد",
++    "d-day": "دی‌دی", "uptalk": "آپ‌تاک", "time": "تایم", "game": "گیم",
++    "man": "من", "interaction": "اینتراکشن", "blinkist": "بلینکیست",
++    "company": "کامپانی", "papal": "پیپال", "dollar": "دلار",
++    "street": "استریت", "german": "جرمن", "enlightenment": "انلایتنمنت",
++    "public": "پابلیک", "choice": "چویس", "society": "سوسایتی",
++    "passion": "پشن", "chain": "چین", "oil": "اویل", "british": "بریتیش",
++    "origin": "اوریجین", "history": "هیستوری", "universal": "یونیورسال",
++    "cost": "کاست", "serfdom": "سرفدام", "india": "ایندیا",
++    "sovereignty": "ساورنتی", "transcontinental": "ترنس‌کانتیننتال",
++    "sleep": "اسلیپ", "oversight": "اوورسایت", "effect": "افکت",
++    "stream": "استریم", "social": "سوشال", "power": "پاور",
++    "city-state": "سیتی‌استیت", "holy": "هولی", "theory": "تئوری",
++    "museum": "موزیوم", "trade": "ترید", "balance": "بالانس",
++    "big": "بیگ", "first": "فرست", "zoom": "زوم", "anxiety": "انگزایتی",
++    "supply": "ساپلای", "efficiency": "افیشنسی", "compromise": "کامپرومایز",
++    "james": "جیمز", "depression": "دیپرشن", "recovery": "ریکاوری",
++    "poor": "پور", "resurrection": "رزرکشن", "einstein": "اینشتین",
++    "art": "آرت", "thinking": "تینکینگ", "productivity": "پرودکتیویتی",
++    "lost": "لاست", "connections": "کانکشنز", "main": "مین",
++    "puritan": "پیوریتن", "freakonomics": "فریکونومیکس",
++})
++
+ #: Latin letter names, for spelling out unknown acronyms.
+ LETTER_NAMES = {
+     "a": "ای", "b": "بی", "c": "سی", "d": "دی", "e": "ای", "f": "اف",
+@@ -126,6 +160,11 @@
+         if key in self.lexicon:
+             self.resolved[key] += 1
+             return self.lexicon[key]
++        # A lone Latin letter is read as its name, never transliterated:
++        # "ویتامین d" is "ویتامین دی", and the transliterator would give "د".
++        if len(key) == 1 and key.isascii() and key.isalpha():
++            self.resolved[key] += 1
++            return LETTER_NAMES[key]
+         if ACRONYM_RE.match(token):
+             self.unknown[token] += 1
+             return spell_acronym(token)
 diff -urN orig/persian_tts_frontend/normalize.py new/persian_tts_frontend/normalize.py
 --- a/persian_tts_frontend/normalize.py	2026-07-31 16:14:05.000000000 +0100
-+++ b/persian_tts_frontend/normalize.py	2026-08-01 15:47:02.312692188 +0100
-@@ -145,6 +145,15 @@
++++ b/persian_tts_frontend/normalize.py	2026-08-01 16:57:10.608217425 +0100
+@@ -18,7 +18,8 @@
+ 
+ from .chars import (ALL_COMBINING, ELLIPSIS, FOLD_MAP, GUILLEMET_CLOSE,
+                     GUILLEMET_OPEN, HARAKAT, HARAKAT_DROP, INVISIBLE_REMOVE,
+-                    KEPT_PUNCT, PERSIAN_COMMA, PUNCT_MAP, SPACE_LIKE, ZWNJ)
++                    KEPT_PUNCT, PERSIAN_COMMA, PERSIAN_LETTERS, PUNCT_MAP,
++                    SPACE_LIKE, ZWNJ)
+ 
+ # --------------------------------------------------------- phoneme escape guard
+ 
+@@ -145,6 +146,15 @@
      `ها`/`تر`/`ترین` suffixes.
      """
      text = re.sub(r"\s+", " ", text)
@@ -765,7 +1231,7 @@ diff -urN orig/persian_tts_frontend/normalize.py new/persian_tts_frontend/normal
      # No space before closing punctuation. Hyphen and apostrophe are excluded:
      # they are intra-word characters here, and eating the space before a stray
      # dash produces "است- یعنی" instead of a clean pause.
-@@ -153,12 +162,6 @@
+@@ -153,12 +163,6 @@
      # exactly one space after punctuation
      text = re.sub(rf"([{re.escape('.!:' + chr(0x60c) + chr(0x61b) + chr(0x61f))}])"
                    r"(?=\S)", r"\1 ", text)
@@ -778,7 +1244,7 @@ diff -urN orig/persian_tts_frontend/normalize.py new/persian_tts_frontend/normal
      return text.strip()
  
  
-@@ -196,9 +199,28 @@
+@@ -196,9 +200,49 @@
  ZWNJ_SUFFIX_RE = re.compile(r"([\u0600-\u06ff]{2,}) (ها|های|هایی|تر|ترین|ام|ات|اش)\b")
  
  
@@ -801,6 +1267,27 @@ diff -urN orig/persian_tts_frontend/normalize.py new/persian_tts_frontend/normal
 +    return stem + ZWNJ + suffix
 +
 +
++# Letters only. The Arabic block also holds "،" "؛" "؟" "٪" "٬" and the
++# Arabic-Indic digits, and treating those as script would split a thousands
++# separator ("1،250" -> "1 ،250") straight back into a misread number.
++_FA = re.escape("".join(sorted(PERSIAN_LETTERS)))
++SCRIPT_BOUNDARY_RE = re.compile(
++    rf"(?<=[A-Za-z0-9])(?=[{_FA}])|(?<=[{_FA}])(?=[A-Za-z0-9])")
++
++
++def separate_scripts(text: str) -> str:
++    """Put a space where Latin/digits touch Persian with nothing between them.
++
++    Transcripts drop the space constantly -- "GTA6منتشر", "Great Depressionایم",
++    "60تا", "33ساله". Every rule downstream replaces its match in place, so
++    without this the expansion welds itself to the neighbour and invents a word:
++    "60تا" came out as "شصتتا". Runs before expansion and again between
++    expansion and Latin resolution, because expanding a digit can create a fresh
++    boundary ("GTA6" -> "GTAشش").
++    """
++    return SCRIPT_BOUNDARY_RE.sub(" ", text)
++
++
  def repair_zwnj(text: str) -> str:
      text = ZWNJ_PREFIX_RE.sub(rf"\1{ZWNJ}\2", text)
 -    text = ZWNJ_SUFFIX_RE.sub(rf"\1{ZWNJ}\2", text)
@@ -810,7 +1297,7 @@ diff -urN orig/persian_tts_frontend/normalize.py new/persian_tts_frontend/normal
  
 diff -urN orig/persian_tts_frontend/numbers.py new/persian_tts_frontend/numbers.py
 --- a/persian_tts_frontend/numbers.py	2026-07-31 16:14:05.000000000 +0100
-+++ b/persian_tts_frontend/numbers.py	2026-08-01 15:47:02.312692188 +0100
++++ b/persian_tts_frontend/numbers.py	2026-08-01 16:57:10.608217425 +0100
 @@ -10,6 +10,7 @@
  
  ZERO = "صفر"
@@ -821,7 +1308,7 @@ diff -urN orig/persian_tts_frontend/numbers.py new/persian_tts_frontend/numbers.
  ONES = ["", "یک", "دو", "سه", "چهار", "پنج", "شش", "هفت", "هشت", "نه"]
 diff -urN orig/persian_tts_frontend/pipeline.py new/persian_tts_frontend/pipeline.py
 --- a/persian_tts_frontend/pipeline.py	2026-07-31 16:14:05.000000000 +0100
-+++ b/persian_tts_frontend/pipeline.py	2026-08-01 15:47:02.312692188 +0100
++++ b/persian_tts_frontend/pipeline.py	2026-08-01 16:57:10.608217425 +0100
 @@ -11,6 +11,7 @@
  import inspect
  import json
@@ -848,7 +1335,26 @@ diff -urN orig/persian_tts_frontend/pipeline.py new/persian_tts_frontend/pipelin
                  h.update(inspect.getsource(mod).encode("utf-8"))
              h.update(json.dumps(
                  {k: sorted(v) if isinstance(v, frozenset) else v
-@@ -137,7 +144,16 @@
+@@ -112,11 +119,18 @@
+         text = normalize.normalize_punctuation(
+             text, parens_to_commas=self.cfg.parens_to_commas)
+ 
++        # 4b. script boundaries -- every rule below substitutes in place, so a
++        #     missing space between scripts would weld the replacement to its
++        #     neighbour ("60تا" -> "شصتتا").
++        text = normalize.separate_scripts(text)
++
+         # 5. numeric / symbolic expansion (needs ASCII digits, hence after fold)
+         if self.cfg.expand_numerics:
+             text = expand.expand_all(text,
+                                      decimal_style=self.cfg.decimal_style,
+                                      skip=self.cfg.skip_expansions)
++            # expanding a digit can expose a new boundary: "GTA6" -> "GTAشش"
++            text = normalize.separate_scripts(text)
+ 
+         # 6. latin resolution (after numerics so "iPhone 15" reads correctly).
+         #    The resolver's "escalate" strategy emits new {escapes}; those must
+@@ -137,7 +151,16 @@
          # 9. charset guard
          unexpected = tuple(sorted(set(self._allowed_re.findall(text))))
          if unexpected and self.cfg.strip_unknown_chars:
@@ -868,7 +1374,7 @@ diff -urN orig/persian_tts_frontend/pipeline.py new/persian_tts_frontend/pipelin
          # 10. escapes back
 diff -urN orig/pyproject.toml new/pyproject.toml
 --- a/pyproject.toml	2026-07-31 16:14:06.000000000 +0100
-+++ b/pyproject.toml	2026-08-01 15:47:02.312692188 +0100
++++ b/pyproject.toml	2026-08-01 16:57:10.608217425 +0100
 @@ -7,10 +7,11 @@
  version = "1.0.0"
  description = "Persian text normalization frontend for VoxCPM 2 fine-tuning"
@@ -885,7 +1391,7 @@ diff -urN orig/pyproject.toml new/pyproject.toml
  packages = ["persian_tts_frontend"]
 diff -urN orig/README.md new/README.md
 --- a/README.md	2026-07-31 16:14:06.000000000 +0100
-+++ b/README.md	2026-08-01 15:47:02.312692188 +0100
++++ b/README.md	2026-08-01 16:57:10.608217425 +0100
 @@ -63,9 +63,66 @@
      --output /data/manifests/cv.jsonl --dataset-id 3 --tier diversity
  ```
@@ -967,7 +1473,7 @@ diff -urN orig/README.md new/README.md
  scripts/run_audit.py
 diff -urN orig/tests/test_frontend.py new/tests/test_frontend.py
 --- a/tests/test_frontend.py	2026-07-31 16:14:05.000000000 +0100
-+++ b/tests/test_frontend.py	2026-08-01 15:47:02.312692188 +0100
++++ b/tests/test_frontend.py	2026-08-01 16:57:10.608217425 +0100
 @@ -112,6 +112,78 @@
            "no ASCII digits survive expansion")
  
@@ -1089,7 +1595,7 @@ diff -urN orig/tests/test_frontend.py new/tests/test_frontend.py
  
  
  def test_latin_resolution():
-@@ -248,6 +355,172 @@
+@@ -248,6 +355,308 @@
            "transliterate leaves no Latin", nz3("برند Sharp"), "no ascii")
  
  
@@ -1185,6 +1691,142 @@ diff -urN orig/tests/test_frontend.py new/tests/test_frontend.py
 +    eq(q["max"], 5.0, "quantile max")
 +    eq(q["median"], 3.0, "quantile median")
 +    eq(_quantiles([2.0])["median"], 2.0, "single value does not index past end")
++
++
++def test_script_boundary_separation():
++    """Transcripts drop the space between scripts constantly. Every rule
++    substitutes in place, so "60تا" was expanding into the welded "شصتتا"."""
++    nz = Normalizer(config=NormalizerConfig(latin_strategy="transliterate"))
++    eq(nz("60تا تاجر"), "شصت تا تاجر", "digit welded to Persian")
++    eq(nz("حدود 33ساله شده"), "حدود سی و سه ساله شده", "digit before a suffix")
++    eq(nz("ما Great Depressionایم"), "ما گریت دیپرشن ایم", "Latin welded to Persian")
++    # a digit expanded mid-token creates a fresh boundary: GTA6 -> GTAشش
++    eq(nz("تریلر GTA6منتشر شد"), "تریلر جی‌تی‌ای شش منتشر شد",
++       "boundary created by expansion")
++    # Persian punctuation lives in the same Unicode block as the letters and
++    # must NOT count as script, or a thousands separator gets split apart
++    eq(nz("جمعیت 1,250,000 نفر"), "جمعیت یک میلیون و دویست و پنجاه هزار نفر",
++       "thousands separator survives")
++    eq(nz("کتاب ۵ام را خواند"), "کتاب پنجم را خواند", "ordinal still joins")
++    eq(nz("سرعت ۸۰ کیلومتر بود"), "سرعت هشتاد کیلومتر بود", "units unaffected")
++
++
++def test_latin_lexicon_and_single_letters():
++    """The corpus head must resolve to real Persian, not to the crude
++    transliterator -- "the" transliterates to the single letter "ت"."""
++    nz = Normalizer(config=NormalizerConfig(latin_strategy="transliterate"))
++    eq(nz("کتاب the great depression را خواند"),
++       "کتاب د گریت دیپرشن را خواند", "frequent English words come from lexicon")
++    # a lone Latin letter is a letter name, never a transliterated consonant
++    eq(nz("ویتامین d بخور"), "ویتامین دی بخور", "single letter reads as a name")
++    eq(nz("نقطه a تا b"), "نقطه ای تا بی", "single letters in sequence")
++    # acronyms still spell out, and the long tail still transliterates
++    check("دی‌ان‌ای" in nz("آزمایش DNA داد"), "acronym spelled out",
++          nz("آزمایش DNA داد"), "دی‌ان‌ای")
++    out = nz("شرکت zqxwv")
++    check("{" not in out and any("؀" <= c <= "ۿ" for c in out),
++          "unknown word transliterates rather than escaping", out, "Persian")
++    # ... but under the default strategy it must still escalate, not invent
++    nz2 = Normalizer()
++    check("{zqxwv}" in nz2("شرکت zqxwv"), "escalate is still the safe default",
++          nz2("شرکت zqxwv"), "{zqxwv}")
++
++
++def test_arrow_manifest_writer():
++    try:
++        import pyarrow as pa
++    except ImportError:
++        return
++    import tempfile
++    from persian_tts_frontend.cli import ArrowManifestWriter
++
++    with tempfile.TemporaryDirectory() as d:
++        p = str(Path(d) / "m.arrow")
++        w = ArrowManifestWriter(p)
++        w.write({"audio": "a.wav", "text": "یک", "duration": 1.5})
++        w.write({"audio": "b.wav", "text": "دو", "mos_bak": 4.0})  # ragged keys
++        n, cols = w.close()
++        eq(n, 2, "arrow writer row count")
++        check("mos_bak" in cols and "duration" in cols,
++              "schema is the union of all row keys", cols, "both columns")
++        with pa.memory_map(p, "rb") as src:
++            back = pa.ipc.open_stream(src).read_all().to_pylist()
++        eq(len(back), 2, "round-trips")
++        eq(back[0]["text"], "یک", "round-trips text")
++        eq(back[1]["duration"], None, "missing key becomes null")
++
++
++def test_build_dataset_preserves_audio():
++    """`build` reproduces the corpus rather than pointing at it: the audio must
++    come out byte-identical while the transcript is replaced."""
++    try:
++        import pyarrow as pa
++    except ImportError:
++        return
++    import argparse
++    import hashlib
++    import io
++    import json
++    import tempfile
++    import wave
++    from persian_tts_frontend.cli import run_build
++
++    def wav(sec, fill):
++        b = io.BytesIO()
++        with wave.open(b, "wb") as w:
++            w.setnchannels(1)
++            w.setsampwidth(2)
++            w.setframerate(16000)
++            w.writeframes(fill * int(16000 * sec))
++        return b.getvalue()
++
++    rows = [("در سال ۱۴۰۳ رشد داشت", 5.0, b"\x11\x22", 4.2),
++            ("این کیفیت پایین است", 4.0, b"\x33\x44", 2.1)]
++    with tempfile.TemporaryDirectory() as d:
++        src, out = str(Path(d) / "src"), str(Path(d) / "out")
++        Path(src).mkdir()
++        tbl = pa.table({
++            "sentence": pa.array([r[0] for r in rows]),
++            "audio": pa.array([{"bytes": wav(r[1], r[2]), "path": None}
++                               for r in rows],
++                              type=pa.struct([("bytes", pa.binary()),
++                                              ("path", pa.string())])),
++            "mos_bak": pa.array([r[3] for r in rows], type=pa.float64()),
++        })
++        with pa.OSFile(str(Path(src) / "data-00000-of-00001.arrow"), "wb") as s:
++            w = pa.ipc.new_stream(s, tbl.schema)
++            w.write_table(tbl)
++            w.close()
++
++        args = argparse.Namespace(
++            input=src, output_dataset=out, report=None, split=None,
++            text_field="sentence", audio_field="audio",
++            duration_field="duration", duration_from_audio=True,
++            sampling_rate=16000, shard_mb=500, keep_fields="mos_bak",
++            min_field=["mos_bak=3.0"], max_field=[], drop_text_matching=None,
++            min_duration=0.0, max_duration=0.0, min_words=2, max_chars=600,
++            dataset_id=1, tier="core", strip_harakat=False, keep_parens=False,
++            decimal_style="momayez", latin_strategy="escalate")
++        run_build(args)
++
++        with pa.memory_map(str(Path(out) / "data-00000.arrow"), "rb") as s:
++            t = pa.ipc.open_stream(s).read_all()
++        eq(t.num_rows, 1, "gate applied during build")
++        got = t.column("audio").to_pylist()[0]["bytes"]
++        eq(hashlib.md5(got).hexdigest(),
++           hashlib.md5(wav(5.0, b"\x11\x22")).hexdigest(),
++           "audio bytes survive byte-identical")
++        eq(t.column("text").to_pylist()[0], "در سال هزار و چهارصد و سه رشد داشت",
++           "text is the normalized form")
++        eq(t.column("duration").to_pylist()[0], 5.0, "duration derived")
++        feats = json.loads(t.schema.metadata[b"huggingface"])["info"]["features"]
++        eq(feats["audio"]["_type"], "Audio", "audio stays an Audio feature")
++        eq(feats["audio"]["sampling_rate"], 16000, "sampling rate declared")
++        # the save_to_disk sidecars datasets.load_from_disk needs
++        info = json.load(open(str(Path(out) / "dataset_info.json")))
++        state = json.load(open(str(Path(out) / "state.json")))
++        eq(info["splits"]["train"]["num_examples"], 1, "dataset_info row count")
++        eq(len(state["_data_files"]), 1, "state lists the shard")
 +
 +
 +def test_wav_duration_from_header():

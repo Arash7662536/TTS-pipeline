@@ -119,11 +119,18 @@ class Normalizer:
         text = normalize.normalize_punctuation(
             text, parens_to_commas=self.cfg.parens_to_commas)
 
+        # 4b. script boundaries -- every rule below substitutes in place, so a
+        #     missing space between scripts would weld the replacement to its
+        #     neighbour ("60تا" -> "شصتتا").
+        text = normalize.separate_scripts(text)
+
         # 5. numeric / symbolic expansion (needs ASCII digits, hence after fold)
         if self.cfg.expand_numerics:
             text = expand.expand_all(text,
                                      decimal_style=self.cfg.decimal_style,
                                      skip=self.cfg.skip_expansions)
+            # expanding a digit can expose a new boundary: "GTA6" -> "GTAشش"
+            text = normalize.separate_scripts(text)
 
         # 6. latin resolution (after numerics so "iPhone 15" reads correctly).
         #    The resolver's "escalate" strategy emits new {escapes}; those must

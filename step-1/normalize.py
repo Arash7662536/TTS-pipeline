@@ -18,7 +18,8 @@ import unicodedata
 
 from .chars import (ALL_COMBINING, ELLIPSIS, FOLD_MAP, GUILLEMET_CLOSE,
                     GUILLEMET_OPEN, HARAKAT, HARAKAT_DROP, INVISIBLE_REMOVE,
-                    KEPT_PUNCT, PERSIAN_COMMA, PUNCT_MAP, SPACE_LIKE, ZWNJ)
+                    KEPT_PUNCT, PERSIAN_COMMA, PERSIAN_LETTERS, PUNCT_MAP,
+                    SPACE_LIKE, ZWNJ)
 
 # --------------------------------------------------------- phoneme escape guard
 
@@ -216,6 +217,27 @@ def _join_suffix(m):
             and m.string[m.start(1) - 1] == ZWNJ):
         return m.group(0)
     return stem + ZWNJ + suffix
+
+
+# Letters only. The Arabic block also holds "،" "؛" "؟" "٪" "٬" and the
+# Arabic-Indic digits, and treating those as script would split a thousands
+# separator ("1،250" -> "1 ،250") straight back into a misread number.
+_FA = re.escape("".join(sorted(PERSIAN_LETTERS)))
+SCRIPT_BOUNDARY_RE = re.compile(
+    rf"(?<=[A-Za-z0-9])(?=[{_FA}])|(?<=[{_FA}])(?=[A-Za-z0-9])")
+
+
+def separate_scripts(text: str) -> str:
+    """Put a space where Latin/digits touch Persian with nothing between them.
+
+    Transcripts drop the space constantly -- "GTA6منتشر", "Great Depressionایم",
+    "60تا", "33ساله". Every rule downstream replaces its match in place, so
+    without this the expansion welds itself to the neighbour and invents a word:
+    "60تا" came out as "شصتتا". Runs before expansion and again between
+    expansion and Latin resolution, because expanding a digit can create a fresh
+    boundary ("GTA6" -> "GTAشش").
+    """
+    return SCRIPT_BOUNDARY_RE.sub(" ", text)
 
 
 def repair_zwnj(text: str) -> str:
