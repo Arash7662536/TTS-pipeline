@@ -173,10 +173,15 @@ def expand_abbreviations(text: str) -> str:
     A naive str.replace here is a real hazard: "م." matches the tail of
     "گرفتیم." and silently rewrites "we took a photo" as "we took AD". Every
     abbreviation must be anchored against adjacent letters on both sides.
+
+    ZWNJ counts as a letter for that purpose. It is U+200C, outside the Arabic
+    block, so leaving it out of the guard reopened exactly the hazard the guard
+    exists to close: the colloquial clitics in `\u062e\u0648\u0646\u0647\u200c\u0645.` / `\u062e\u0648\u0646\u0647\u200c\u0634.` attach with
+    a ZWNJ, and at the end of a sentence they became "\u0645\u06cc\u0644\u0627\u062f\u06cc" / "\u0634\u0645\u0627\u0631\u0647".
     """
     for abbr in sorted(ABBREVIATIONS, key=len, reverse=True):
-        pat = (r"(?<![\u0600-\u06ffA-Za-z])" + re.escape(abbr)
-               + r"(?![\u0600-\u06ffA-Za-z])")
+        pat = (rf"(?<![\u0600-\u06ffA-Za-z{ZWNJ}])" + re.escape(abbr)
+               + rf"(?![\u0600-\u06ffA-Za-z{ZWNJ}])")
         text = re.sub(pat, " " + ABBREVIATIONS[abbr] + " ", text)
     return text
 

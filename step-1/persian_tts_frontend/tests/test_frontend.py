@@ -149,6 +149,41 @@ def test_thousands_separator():
           "یک، دویست و پنجاه")
 
 
+def test_abbreviation_guard_covers_zwnj():
+    """ZWNJ is U+200C, outside the Arabic block, so it has to be named in the
+    abbreviation boundary guard explicitly. Colloquial clitics attach with one,
+    and at the end of a sentence "خونه‌م." was being read as "خونه میلادی"."""
+    nz = Normalizer()
+    for s in ["خونه‌م.", "بچه‌م.", "خونه‌ش.", "مسئول‌ش."]:
+        eq(nz(s), s, f"ZWNJ clitic untouched: {s}")
+    check("میلادی" not in nz("این حرفِ منه، خونه‌م. بعد رفتیم"),
+          "clitic mid-sentence", nz("این حرفِ منه، خونه‌م. بعد رفتیم"),
+          "no میلادی")
+    # the guard must not have been loosened into uselessness
+    eq(nz("ص. ۱۲ را ببین"), "صفحه دوازده را ببین", "real abbreviation still expands")
+    eq(nz("ج. ۳ منتشر شد"), "جلد سه منتشر شد", "real abbreviation still expands")
+    check("قبل از میلاد" in nz("در ۳۳۰ ق.م"), "multi-part abbreviation",
+          nz("در ۳۳۰ ق.م"), "قبل از میلاد")
+    eq(nz("گرفتیم."), "گرفتیم.", "plain letter boundary still guarded")
+
+
+def test_idempotence_regressions():
+    """Each of these broke `nz(nz(x)) == nz(x)` on the thomclas corpus."""
+    nz = Normalizer()
+    cases = {
+        "srt": "استفاده کرده 130 00:13:30,686 --> 00:13:30,666 میشه اینطور",
+        "colon_zwnj": "یک:‌ توانایی یادگیری‌مون داره می‌آد پایین",
+        "double_dot": "ارتشی و نظامی هم که مسئول‌ش .. این‌که من در واقع",
+    }
+    for label, s in cases.items():
+        once = nz(s)
+        eq(nz(once), once, f"idempotent: {label}")
+    check("توانایی" in nz(cases["colon_zwnj"])
+          and "یک: توانایی" in nz(cases["colon_zwnj"]),
+          "ZWNJ after a colon does not glue the next word",
+          nz(cases["colon_zwnj"]), "یک: توانایی ...")
+
+
 def test_punctuation():
     nz = Normalizer()
     check("\u060c" in nz("سلام, خوبی"), "ASCII comma -> Persian comma")

@@ -138,6 +138,11 @@ class Normalizer:
         unexpected = tuple(sorted(set(self._allowed_re.findall(text))))
         if unexpected and self.cfg.strip_unknown_chars:
             text = self._allowed_re.sub("", text)
+            # Stripping can expose punctuation artifacts that step 7 already
+            # walked past -- deleting the ">" of an SRT "-->" leaves a dangling
+            # dash that only a second cleanup turns into a single pause. Redo it
+            # here rather than let the text fail the idempotence invariant.
+            text = normalize.cleanup(text)
             text = normalize.fix_spacing(text)
 
         # 10. escapes back

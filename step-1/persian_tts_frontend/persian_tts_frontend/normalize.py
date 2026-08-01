@@ -145,6 +145,15 @@ def fix_spacing(text: str) -> str:
     `ها`/`تر`/`ترین` suffixes.
     """
     text = re.sub(r"\s+", " ", text)
+    # Nothing adjacent to ZWNJ but letters. This must precede the punctuation
+    # spacing below: to the `(?=\S)` rule a ZWNJ is a non-space, so in
+    # "یک:‌ توانایی" the space it inserts lands in front of a ZWNJ that the next
+    # rule deletes -- leaving "یک:توانایی" glued until a second pass fixes it.
+    text = re.sub(rf"\s+{ZWNJ}", ZWNJ, text)
+    text = re.sub(rf"{ZWNJ}\s+", ZWNJ, text)
+    text = re.sub(rf"{ZWNJ}{{2,}}", ZWNJ, text)
+    text = re.sub(rf"{ZWNJ}(?![؀-ۿ])", "", text)
+    text = re.sub(rf"(?<![؀-ۿ]){ZWNJ}", "", text)
     # No space before closing punctuation. Hyphen and apostrophe are excluded:
     # they are intra-word characters here, and eating the space before a stray
     # dash produces "است- یعنی" instead of a clean pause.
@@ -153,12 +162,6 @@ def fix_spacing(text: str) -> str:
     # exactly one space after punctuation
     text = re.sub(rf"([{re.escape('.!:' + chr(0x60c) + chr(0x61b) + chr(0x61f))}])"
                   r"(?=\S)", r"\1 ", text)
-    # nothing adjacent to ZWNJ but letters
-    text = re.sub(rf"\s+{ZWNJ}", ZWNJ, text)
-    text = re.sub(rf"{ZWNJ}\s+", ZWNJ, text)
-    text = re.sub(rf"{ZWNJ}{{2,}}", ZWNJ, text)
-    text = re.sub(rf"{ZWNJ}(?![\u0600-\u06ff])", "", text)
-    text = re.sub(rf"(?<![\u0600-\u06ff]){ZWNJ}", "", text)
     return text.strip()
 
 
