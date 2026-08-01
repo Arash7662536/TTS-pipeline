@@ -10,6 +10,7 @@ from .chars import ZWNJ
 
 ZERO = "صفر"
 NEGATIVE = "منفی"
+POSITIVE = "مثبت"
 AND = " و "
 
 ONES = ["", "یک", "دو", "سه", "چهار", "پنج", "شش", "هفت", "هشت", "نه"]

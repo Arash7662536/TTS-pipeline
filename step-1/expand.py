@@ -9,7 +9,8 @@ digits a date rule needed.
 import re
 
 from . import numbers as N
-from .chars import (PERSIAN_DECIMAL, PERSIAN_PERCENT, PERSIAN_THOUSANDS, ZWNJ)
+from .chars import (PERSIAN_COMMA, PERSIAN_DECIMAL, PERSIAN_PERCENT,
+                    PERSIAN_THOUSANDS, ZWNJ)
 
 # ------------------------------------------------------------------ calendars
 
@@ -72,7 +73,16 @@ RE_FRACTION = re.compile(rf"\b({_D}+)\s*/\s*({_D}+)\b")
 RE_RANGE = re.compile(rf"({_D}+)\s*[-\u2013\u2014]\s*({_D}+)")
 RE_ORDINAL = re.compile(rf"\b({_D}+)\s*(?:{ZWNJ}?ام|{ZWNJ}?مین)\b")
 RE_DECIMAL = re.compile(rf"({_D}+)[{PERSIAN_DECIMAL}\.]({_D}+)")
-RE_THOUSANDS = re.compile(rf"(?<={_D})[,{PERSIAN_THOUSANDS}](?={_D}{{3}}\b)")
+# PERSIAN_COMMA belongs here even though it is not a thousands separator: the
+# punctuation pass runs first and has already turned every ASCII "," into "،",
+# so "1,250" reaches this rule as "1،250". A real enumeration keeps its space
+# ("1، 250") and the no-space lookahead below leaves it alone.
+RE_THOUSANDS = re.compile(
+    rf"(?<={_D})[,{PERSIAN_THOUSANDS}{PERSIAN_COMMA}](?={_D}{{3}}\b)")
+# A sign only counts when it is glued to the digits AND starts a token:
+#   "-5"  -> negative           "12-15"  -> range, the dash is preceded by a digit
+#   "+16" -> positive           "- 5"    -> dash list marker / prosodic break
+RE_SIGNED = re.compile(rf"(?:(?<=^)|(?<=\s))([+-])({_D})")
 RE_INT = re.compile(rf"{_D}+")
 RE_UNIT = re.compile(
     r"(?<=[0-9\s])(" + "|".join(
@@ -180,6 +190,20 @@ def expand_fractions(text: str) -> str:
     return RE_FRACTION.sub(sub, text)
 
 
+def expand_signs(text: str) -> str:
+    """`-5` -> `منفی 5`, `+16` -> `مثبت 16`.
+
+    Only the sign is rewritten; the digits are left for the later numeric rules,
+    so `-12.5 کیلومتر` still goes through decimals and units. Without this the
+    `+` was dropped by the charset guard (visible in the report) and the `-` was
+    silently rewritten to a comma by the punctuation pass -- which read a
+    negative temperature as a positive one.
+    """
+    return RE_SIGNED.sub(
+        lambda m: (N.NEGATIVE if m.group(1) == "-" else N.POSITIVE)
+        + " " + m.group(2), text)
+
+
 def expand_ranges(text: str) -> str:
     return RE_RANGE.sub(
         lambda m: f"{N.cardinal(int(m.group(1)))} تا {N.cardinal(int(m.group(2)))}",
@@ -215,6 +239,7 @@ def strip_thousands(text: str) -> str:
 EXPANSION_ORDER = (
     "abbreviations",
     "thousands",
+    "signs",       # before anything that eats digits, or the sign is orphaned
     "time",
     "dates",
     "phone",
@@ -234,6 +259,7 @@ def expand_all(text: str, decimal_style: str = "momayez",
     steps = {
         "abbreviations": expand_abbreviations,
         "thousands": strip_thousands,
+        "signs": expand_signs,
         "time": expand_time,
         "dates": expand_dates,
         "phone": expand_phone,

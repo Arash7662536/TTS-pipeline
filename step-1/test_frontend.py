@@ -112,6 +112,43 @@ def test_numeric_expansion():
           "no ASCII digits survive expansion")
 
 
+def test_signed_numbers():
+    """A sign glued to a number is read. Both halves used to be wrong: `+` was
+    dropped by the charset guard, `-` was rewritten to a comma, so a negative
+    temperature was voiced as a positive one."""
+    nz = Normalizer()
+    eq(nz("دمای هوا -۵ درجه بود"), "دمای هوا منفی پنج درجه بود", "negative int")
+    eq(nz("به +11 درجه رسید"), "به مثبت یازده درجه رسید", "positive int")
+    check("منفی دوازده ممیز پنج" in nz("اختلاف -۱۲٫۵ درجه"),
+          "signed decimal", nz("اختلاف -۱۲٫۵ درجه"), "منفی دوازده ممیز پنج")
+    check(not nz.normalize("قاره +16 و +11 درجه").unexpected,
+          "no stray sign reaches the charset guard")
+    # ... but a dash that is not a sign must keep its old meaning
+    check("تا" in nz("بین ۱۲-۱۵ نفر"), "digit-dash-digit stays a range",
+          nz("بین ۱۲-۱۵ نفر"), "has تا")
+    check("منفی" not in nz("- ۵ نکته مهم"), "spaced dash is a list marker",
+          nz("- ۵ نکته مهم"), "no منفی")
+    check("ژانویه" in nz("در تاریخ 2024-01-15 منتشر شد"),
+          "dashed date still a date", nz("در تاریخ 2024-01-15"), "has ژانویه")
+
+
+def test_thousands_separator():
+    """The punctuation pass turns "," into "،" before expansion sees it, so the
+    grouping rule has to recognise the Persian comma too -- otherwise "1,250"
+    reads as "one, two hundred fifty"."""
+    nz = Normalizer()
+    eq(nz("بدهی 1,250 دلار"), "بدهی هزار و دویست و پنجاه دلار", "ASCII grouping")
+    eq(nz("قیمت ۱٬۲۵۰ تومان"), "قیمت هزار و دویست و پنجاه تومان",
+       "Persian grouping mark")
+    check("یک میلیون و دویست و پنجاه هزار" in nz("جمعیت 1,250,000 نفر"),
+          "multi-group", nz("جمعیت 1,250,000 نفر"), "یک میلیون و ...")
+    # A spaced comma is an enumeration, not a grouping mark.
+    check("دویست و پنجاه" in nz("بندهای 1, 250 را ببین")
+          and "هزار" not in nz("بندهای 1, 250 را ببین"),
+          "spaced comma stays an enumeration", nz("بندهای 1, 250 را ببین"),
+          "یک، دویست و پنجاه")
+
+
 def test_punctuation():
     nz = Normalizer()
     check("\u060c" in nz("سلام, خوبی"), "ASCII comma -> Persian comma")
