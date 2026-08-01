@@ -449,6 +449,142 @@ def test_field_bounds_and_quantiles():
     eq(_quantiles([2.0])["median"], 2.0, "single value does not index past end")
 
 
+def test_script_boundary_separation():
+    """Transcripts drop the space between scripts constantly. Every rule
+    substitutes in place, so "60تا" was expanding into the welded "شصتتا"."""
+    nz = Normalizer(config=NormalizerConfig(latin_strategy="transliterate"))
+    eq(nz("60تا تاجر"), "شصت تا تاجر", "digit welded to Persian")
+    eq(nz("حدود 33ساله شده"), "حدود سی و سه ساله شده", "digit before a suffix")
+    eq(nz("ما Great Depressionایم"), "ما گریت دیپرشن ایم", "Latin welded to Persian")
+    # a digit expanded mid-token creates a fresh boundary: GTA6 -> GTAشش
+    eq(nz("تریلر GTA6منتشر شد"), "تریلر جی‌تی‌ای شش منتشر شد",
+       "boundary created by expansion")
+    # Persian punctuation lives in the same Unicode block as the letters and
+    # must NOT count as script, or a thousands separator gets split apart
+    eq(nz("جمعیت 1,250,000 نفر"), "جمعیت یک میلیون و دویست و پنجاه هزار نفر",
+       "thousands separator survives")
+    eq(nz("کتاب ۵ام را خواند"), "کتاب پنجم را خواند", "ordinal still joins")
+    eq(nz("سرعت ۸۰ کیلومتر بود"), "سرعت هشتاد کیلومتر بود", "units unaffected")
+
+
+def test_latin_lexicon_and_single_letters():
+    """The corpus head must resolve to real Persian, not to the crude
+    transliterator -- "the" transliterates to the single letter "ت"."""
+    nz = Normalizer(config=NormalizerConfig(latin_strategy="transliterate"))
+    eq(nz("کتاب the great depression را خواند"),
+       "کتاب د گریت دیپرشن را خواند", "frequent English words come from lexicon")
+    # a lone Latin letter is a letter name, never a transliterated consonant
+    eq(nz("ویتامین d بخور"), "ویتامین دی بخور", "single letter reads as a name")
+    eq(nz("نقطه a تا b"), "نقطه ای تا بی", "single letters in sequence")
+    # acronyms still spell out, and the long tail still transliterates
+    check("دی‌ان‌ای" in nz("آزمایش DNA داد"), "acronym spelled out",
+          nz("آزمایش DNA داد"), "دی‌ان‌ای")
+    out = nz("شرکت zqxwv")
+    check("{" not in out and any("؀" <= c <= "ۿ" for c in out),
+          "unknown word transliterates rather than escaping", out, "Persian")
+    # ... but under the default strategy it must still escalate, not invent
+    nz2 = Normalizer()
+    check("{zqxwv}" in nz2("شرکت zqxwv"), "escalate is still the safe default",
+          nz2("شرکت zqxwv"), "{zqxwv}")
+
+
+def test_arrow_manifest_writer():
+    try:
+        import pyarrow as pa
+    except ImportError:
+        return
+    import tempfile
+    from persian_tts_frontend.cli import ArrowManifestWriter
+
+    with tempfile.TemporaryDirectory() as d:
+        p = str(Path(d) / "m.arrow")
+        w = ArrowManifestWriter(p)
+        w.write({"audio": "a.wav", "text": "یک", "duration": 1.5})
+        w.write({"audio": "b.wav", "text": "دو", "mos_bak": 4.0})  # ragged keys
+        n, cols = w.close()
+        eq(n, 2, "arrow writer row count")
+        check("mos_bak" in cols and "duration" in cols,
+              "schema is the union of all row keys", cols, "both columns")
+        with pa.memory_map(p, "rb") as src:
+            back = pa.ipc.open_stream(src).read_all().to_pylist()
+        eq(len(back), 2, "round-trips")
+        eq(back[0]["text"], "یک", "round-trips text")
+        eq(back[1]["duration"], None, "missing key becomes null")
+
+
+def test_build_dataset_preserves_audio():
+    """`build` reproduces the corpus rather than pointing at it: the audio must
+    come out byte-identical while the transcript is replaced."""
+    try:
+        import pyarrow as pa
+    except ImportError:
+        return
+    import argparse
+    import hashlib
+    import io
+    import json
+    import tempfile
+    import wave
+    from persian_tts_frontend.cli import run_build
+
+    def wav(sec, fill):
+        b = io.BytesIO()
+        with wave.open(b, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(16000)
+            w.writeframes(fill * int(16000 * sec))
+        return b.getvalue()
+
+    rows = [("در سال ۱۴۰۳ رشد داشت", 5.0, b"\x11\x22", 4.2),
+            ("این کیفیت پایین است", 4.0, b"\x33\x44", 2.1)]
+    with tempfile.TemporaryDirectory() as d:
+        src, out = str(Path(d) / "src"), str(Path(d) / "out")
+        Path(src).mkdir()
+        tbl = pa.table({
+            "sentence": pa.array([r[0] for r in rows]),
+            "audio": pa.array([{"bytes": wav(r[1], r[2]), "path": None}
+                               for r in rows],
+                              type=pa.struct([("bytes", pa.binary()),
+                                              ("path", pa.string())])),
+            "mos_bak": pa.array([r[3] for r in rows], type=pa.float64()),
+        })
+        with pa.OSFile(str(Path(src) / "data-00000-of-00001.arrow"), "wb") as s:
+            w = pa.ipc.new_stream(s, tbl.schema)
+            w.write_table(tbl)
+            w.close()
+
+        args = argparse.Namespace(
+            input=src, output_dataset=out, report=None, split=None,
+            text_field="sentence", audio_field="audio",
+            duration_field="duration", duration_from_audio=True,
+            sampling_rate=16000, shard_mb=500, keep_fields="mos_bak",
+            min_field=["mos_bak=3.0"], max_field=[], drop_text_matching=None,
+            min_duration=0.0, max_duration=0.0, min_words=2, max_chars=600,
+            dataset_id=1, tier="core", strip_harakat=False, keep_parens=False,
+            decimal_style="momayez", latin_strategy="escalate")
+        run_build(args)
+
+        with pa.memory_map(str(Path(out) / "data-00000.arrow"), "rb") as s:
+            t = pa.ipc.open_stream(s).read_all()
+        eq(t.num_rows, 1, "gate applied during build")
+        got = t.column("audio").to_pylist()[0]["bytes"]
+        eq(hashlib.md5(got).hexdigest(),
+           hashlib.md5(wav(5.0, b"\x11\x22")).hexdigest(),
+           "audio bytes survive byte-identical")
+        eq(t.column("text").to_pylist()[0], "در سال هزار و چهارصد و سه رشد داشت",
+           "text is the normalized form")
+        eq(t.column("duration").to_pylist()[0], 5.0, "duration derived")
+        feats = json.loads(t.schema.metadata[b"huggingface"])["info"]["features"]
+        eq(feats["audio"]["_type"], "Audio", "audio stays an Audio feature")
+        eq(feats["audio"]["sampling_rate"], 16000, "sampling rate declared")
+        # the save_to_disk sidecars datasets.load_from_disk needs
+        info = json.load(open(str(Path(out) / "dataset_info.json")))
+        state = json.load(open(str(Path(out) / "state.json")))
+        eq(info["splits"]["train"]["num_examples"], 1, "dataset_info row count")
+        eq(len(state["_data_files"]), 1, "state lists the shard")
+
+
 def test_wav_duration_from_header():
     """Datasets with embedded audio and no duration column: read it from the
     WAV header, without touching the payload."""

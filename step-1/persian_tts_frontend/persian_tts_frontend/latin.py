@@ -52,6 +52,40 @@ LEXICON = {
     "id": "آی‌دی", "url": "یو‌آر‌ال", "pdf": "پی‌دی‌اف",
 }
 
+#: Corpus-derived additions, ranked from the thomclas `unknown` counter (2317
+#: distinct tokens / 7710 occurrences over 109k rows). These are the head of
+#: that distribution -- the ~90 entries below cover roughly a quarter of all
+#: unresolved word occurrences, and they are the ones the crude transliterator
+#: mangles worst ("the" -> "ت"). A native speaker should review the readings.
+LEXICON.update({
+    "the": "د", "of": "آو", "and": "اند", "in": "این", "to": "تو",
+    "on": "آن", "is": "ایز", "it": "ایت", "if": "ایف", "we": "وی",
+    "out": "اوت", "off": "آف", "per": "پر", "see": "سی", "what": "وات",
+    "deal": "دیل", "new": "نیو", "value": "ولیو", "war": "وار",
+    "great": "گریت", "work": "ورک", "state": "استیت", "junk": "جانک",
+    "people": "پیپل", "good": "گود", "deep": "دیپ", "world": "ورلد",
+    "d-day": "دی‌دی", "uptalk": "آپ‌تاک", "time": "تایم", "game": "گیم",
+    "man": "من", "interaction": "اینتراکشن", "blinkist": "بلینکیست",
+    "company": "کامپانی", "papal": "پیپال", "dollar": "دلار",
+    "street": "استریت", "german": "جرمن", "enlightenment": "انلایتنمنت",
+    "public": "پابلیک", "choice": "چویس", "society": "سوسایتی",
+    "passion": "پشن", "chain": "چین", "oil": "اویل", "british": "بریتیش",
+    "origin": "اوریجین", "history": "هیستوری", "universal": "یونیورسال",
+    "cost": "کاست", "serfdom": "سرفدام", "india": "ایندیا",
+    "sovereignty": "ساورنتی", "transcontinental": "ترنس‌کانتیننتال",
+    "sleep": "اسلیپ", "oversight": "اوورسایت", "effect": "افکت",
+    "stream": "استریم", "social": "سوشال", "power": "پاور",
+    "city-state": "سیتی‌استیت", "holy": "هولی", "theory": "تئوری",
+    "museum": "موزیوم", "trade": "ترید", "balance": "بالانس",
+    "big": "بیگ", "first": "فرست", "zoom": "زوم", "anxiety": "انگزایتی",
+    "supply": "ساپلای", "efficiency": "افیشنسی", "compromise": "کامپرومایز",
+    "james": "جیمز", "depression": "دیپرشن", "recovery": "ریکاوری",
+    "poor": "پور", "resurrection": "رزرکشن", "einstein": "اینشتین",
+    "art": "آرت", "thinking": "تینکینگ", "productivity": "پرودکتیویتی",
+    "lost": "لاست", "connections": "کانکشنز", "main": "مین",
+    "puritan": "پیوریتن", "freakonomics": "فریکونومیکس",
+})
+
 #: Latin letter names, for spelling out unknown acronyms.
 LETTER_NAMES = {
     "a": "ای", "b": "بی", "c": "سی", "d": "دی", "e": "ای", "f": "اف",
@@ -126,6 +160,11 @@ class LatinResolver:
         if key in self.lexicon:
             self.resolved[key] += 1
             return self.lexicon[key]
+        # A lone Latin letter is read as its name, never transliterated:
+        # "ویتامین d" is "ویتامین دی", and the transliterator would give "د".
+        if len(key) == 1 and key.isascii() and key.isalpha():
+            self.resolved[key] += 1
+            return LETTER_NAMES[key]
         if ACRONYM_RE.match(token):
             self.unknown[token] += 1
             return spell_acronym(token)

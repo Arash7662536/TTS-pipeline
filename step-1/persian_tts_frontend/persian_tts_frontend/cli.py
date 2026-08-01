@@ -500,6 +500,7 @@ def run_normalize(args):
     field_values = defaultdict(list)
 
     out = open(args.output, "w", encoding="utf-8") if args.output else None
+    arrow_out = ArrowManifestWriter(args.output_arrow) if args.output_arrow else None
     try:
         for i, r in enumerate(rows):
             if args.limit and i >= args.limit:
@@ -597,7 +598,7 @@ def run_normalize(args):
                 if dur:
                     speaker_seconds[spk] += dur
 
-            if out:
+            if out or arrow_out is not None:
                 row = {"audio": r["audio"], "text": res.text}
                 if dur:
                     row["duration"] = round(float(dur), 3)
@@ -613,10 +614,16 @@ def run_normalize(args):
                     if name in extra and extra[name] is not None:
                         v = extra[name]
                         row[name] = round(v, 4) if isinstance(v, float) else v
-                out.write(json.dumps(row, ensure_ascii=False) + "\n")
+                if out:
+                    out.write(json.dumps(row, ensure_ascii=False) + "\n")
+            if arrow_out is not None:
+                arrow_out.write(row)
     finally:
         if out:
             out.close()
+        if arrow_out is not None:
+            n_rows, cols = arrow_out.close()
+            print(f"arrow manifest: {n_rows} rows -> {args.output_arrow}\n  columns: {', '.join(cols)}", file=sys.stderr)
 
     # ------------------------------------------------------------ the report
     rep = {
@@ -676,6 +683,340 @@ def run_normalize(args):
               "cloning will generalize poorly; grow the diversity tier",
               file=sys.stderr)
     return 0
+
+
+def run_try(args):
+    """Normalize sentences given on the command line or on stdin, and show what
+    the frontend did to them. This is the thing to reach for before trusting a
+    corpus pass -- it is the same Normalizer, same config, same version."""
+    cfg = NormalizerConfig(
+        keep_harakat=not args.strip_harakat,
+        decimal_style=args.decimal_style,
+        latin_strategy=args.latin_strategy,
+        parens_to_commas=not args.keep_parens,
+    )
+    nz = Normalizer(config=cfg)
+
+    if args.text:
+        lines = list(args.text)
+    else:
+        lines = [ln.rstrip("\n") for ln in sys.stdin if ln.strip()]
+    if not lines:
+        raise SystemExit("nothing to normalize -- pass sentences as arguments "
+                         "or pipe them on stdin")
+
+    print(f"frontend version: {nz.version}", file=sys.stderr)
+    for i, raw in enumerate(lines):
+        if i:
+            print()
+        r = nz.normalize(raw)
+        print(f"  in   {raw}")
+        print(f"  out  {r.text}")
+        notes = [f"{r.n_words} words",
+                 f"diacritic_density={r.diacritic_density:.3f}"]
+        if not r.changed:
+            notes.append("unchanged")
+        if nz(r.text) != r.text:
+            notes.append("NOT IDEMPOTENT")
+        print("       " + ", ".join(notes))
+        if r.unexpected:
+            print("       stripped: " + " ".join(
+                f"U+{ord(c):04X} {c!r}" for c in r.unexpected))
+        if r.problems:
+            print("       diacritic problems: " + ", ".join(r.problems))
+        esc = re.findall(r"\{[^{}]*\}", r.text)
+        if esc:
+            print("       unresolved Latin: " + " ".join(esc))
+    if nz.latin.unknown:
+        print("\nnot in the lexicon: "
+              + ", ".join(t for t, _ in nz.latin.work_queue(20)),
+              file=sys.stderr)
+    return 0
+
+
+class ArrowManifestWriter:
+    """Write manifest rows as an Arrow IPC stream, readable by
+    `datasets.Dataset.from_file()` and by `pyarrow.ipc.open_stream`.
+
+    Rows are buffered because the column set is not known up front -- `duration`
+    and the `--keep-fields` columns are per-row optional -- so the schema is the
+    union of every key emitted. A manifest is text plus a handful of scalars, so
+    this stays small next to the audio it points at.
+    """
+
+    def __init__(self, path):
+        self.pa = _pyarrow()
+        self.path = path
+        self.rows = []
+
+    def write(self, row):
+        self.rows.append(row)
+
+    def close(self):
+        pa = self.pa
+        keys = []
+        for r in self.rows:
+            for k in r:
+                if k not in keys:
+                    keys.append(k)
+        table = pa.Table.from_pydict(
+            {k: [r.get(k) for r in self.rows] for k in keys})
+        with pa.OSFile(self.path, "wb") as sink:
+            w = pa.ipc.new_stream(sink, table.schema)
+            w.write_table(table)
+            w.close()
+        return len(self.rows), keys
+
+
+def run_build(args):
+    """Write a self-contained Arrow dataset: the source audio carried through
+    untouched, the transcript replaced by its normalized form.
+
+    Unlike `normalize`, which emits a manifest of pointers, this reproduces the
+    corpus. The audio never becomes a Python object -- rows are selected with
+    an Arrow `take`, so the payload moves buffer-to-buffer and peak memory stays
+    at roughly one source batch regardless of corpus size.
+
+    The result is a `save_to_disk()` layout: `datasets.load_from_disk()` reads
+    it directly, with `audio` still typed as `Audio(sampling_rate=...)`.
+    """
+    pa = _pyarrow()
+    cfg = NormalizerConfig(
+        keep_harakat=not args.strip_harakat,
+        decimal_style=args.decimal_style,
+        latin_strategy=args.latin_strategy,
+        parens_to_commas=not args.keep_parens,
+    )
+    nz = Normalizer(config=cfg)
+    print(f"frontend version: {nz.version}", file=sys.stderr)
+
+    bounds = _parse_bounds(args.min_field, args.max_field)
+    keep_fields = [f for f in (args.keep_fields or "").split(",") if f]
+    wanted = list(dict.fromkeys(keep_fields + list(bounds)))
+    drop_re = re.compile(args.drop_text_matching) if args.drop_text_matching else None
+
+    files = arrow_fragments(args.input, split=args.split)
+    outdir = args.output_dataset
+    os.makedirs(outdir, exist_ok=True)
+    for stale in glob.glob(os.path.join(outdir, "data-*.arrow")):
+        os.remove(stale)
+
+    stats = Counter()
+    densities = []
+    durations = []
+    shard_lengths = []
+    schema = [None]
+    writer = {"w": None, "sink": None, "rows": 0, "bytes": 0, "n": 0}
+    shard_bytes = args.shard_mb * 1024 * 1024
+
+    def open_shard():
+        path = os.path.join(outdir, f"data-{writer['n']:05d}.arrow")
+        writer["sink"] = pa.OSFile(path, "wb")
+        writer["w"] = pa.ipc.new_stream(writer["sink"], schema[0])
+        writer["rows"] = 0
+        writer["bytes"] = 0
+
+    def close_shard():
+        if writer["w"] is None:
+            return
+        writer["w"].close()
+        writer["sink"].close()
+        shard_lengths.append(writer["rows"])
+        writer["w"] = None
+        writer["n"] += 1
+
+    for fp in files:
+        for batch in _arrow_batches(pa, fp):
+            n = batch.num_rows
+            if not n:
+                continue
+
+            texts = _column(pa, batch, args.text_field)
+            if texts is None:
+                raise SystemExit(
+                    f"--text-field {args.text_field!r} is not a column.\n"
+                    "available: " + ", ".join(_field_names(pa, batch.schema)))
+            texts = texts.to_pylist()
+
+            audio_col = _column(pa, batch, args.audio_field)
+            if audio_col is None:
+                raise SystemExit(
+                    f"--audio-field {args.audio_field!r} is not a column.\n"
+                    "available: " + ", ".join(_field_names(pa, batch.schema)))
+
+            dur_col = _column(pa, batch, args.duration_field)
+            if dur_col is not None:
+                durs = dur_col.to_pylist()
+            elif args.duration_from_audio:
+                durs = _audio_durations(pa, audio_col, n)
+            else:
+                durs = [None] * n
+
+            extras = {}
+            for name in wanted:
+                col = _column(pa, batch, name)
+                if col is not None:
+                    extras[name] = col.to_pylist()
+
+            keep, norm_text, raw_text, keep_dur, keep_dens = [], [], [], [], []
+            for k in range(n):
+                stats["read"] += 1
+                raw = (texts[k] or "").strip()
+                if not raw:
+                    stats["drop_empty_source"] += 1
+                    continue
+                if drop_re is not None and drop_re.search(raw):
+                    stats["drop_text_pattern"] += 1
+                    continue
+                gated = False
+                for name, (lo, hi) in bounds.items():
+                    v = _as_number(extras.get(name, [None] * n)[k])
+                    if v is None:
+                        stats[f"drop_{name}_missing"] += 1
+                        gated = True
+                        break
+                    if (lo is not None and v < lo) or (hi is not None and v > hi):
+                        stats[f"drop_{name}_out_of_range"] += 1
+                        gated = True
+                        break
+                if gated:
+                    continue
+                d = _as_float(durs[k])
+                if args.min_duration or args.max_duration:
+                    if d is None:
+                        stats["drop_duration_unknown"] += 1
+                        continue
+                    if args.min_duration and d < args.min_duration:
+                        stats["drop_too_short_audio"] += 1
+                        continue
+                    if args.max_duration and d > args.max_duration:
+                        stats["drop_too_long_audio"] += 1
+                        continue
+
+                res = nz.normalize(raw)
+                if not res.text.strip():
+                    stats["drop_empty_after_norm"] += 1
+                    continue
+                if args.min_words and res.n_words < args.min_words:
+                    stats["drop_too_short"] += 1
+                    continue
+                if args.max_chars and len(res.text) > args.max_chars:
+                    stats["drop_too_long"] += 1
+                    continue
+
+                stats["kept"] += 1
+                keep.append(k)
+                norm_text.append(res.text)
+                raw_text.append(raw)
+                keep_dur.append(d)
+                keep_dens.append(round(res.diacritic_density, 4))
+                densities.append(res.diacritic_density)
+                if d:
+                    durations.append(d)
+
+            if not keep:
+                continue
+
+            idx = pa.array(keep, type=pa.int32())
+            cols = {
+                "audio": audio_col.take(idx),          # buffers, not Python
+                "text": pa.array(norm_text, type=pa.string()),
+                "text_raw": pa.array(raw_text, type=pa.string()),
+                "duration": pa.array(keep_dur, type=pa.float64()),
+                "dataset_id": pa.array([args.dataset_id] * len(keep),
+                                       type=pa.int64()),
+                "tier": pa.array([args.tier] * len(keep), type=pa.string()),
+                "norm_version": pa.array([nz.version] * len(keep),
+                                         type=pa.string()),
+                "diacritic_density": pa.array(keep_dens, type=pa.float64()),
+            }
+            for name in keep_fields:
+                if name in extras:
+                    cols[name] = pa.array([extras[name][k] for k in keep],
+                                          type=pa.float64())
+
+            if schema[0] is None:
+                schema[0] = _hf_schema(pa, cols, args.sampling_rate)
+            rb = pa.RecordBatch.from_arrays(list(cols.values()),
+                                            schema=schema[0])
+            if writer["w"] is None:
+                open_shard()
+            writer["w"].write_batch(rb)
+            writer["rows"] += rb.num_rows
+            writer["bytes"] += rb.nbytes
+            if writer["bytes"] >= shard_bytes:
+                close_shard()
+    close_shard()
+
+    if not shard_lengths:
+        raise SystemExit("no rows survived the filters -- nothing written")
+
+    total = sum(shard_lengths)
+    _write_hf_metadata(outdir, schema[0], shard_lengths, total, args.split or "train")
+
+    rep = {
+        "frontend_version": nz.version,
+        "counts": dict(stats),
+        "keep_rate": round(stats["kept"] / max(1, stats["read"]), 4),
+        "shards": len(shard_lengths),
+        "rows": total,
+        "diacritic_density": {
+            "mean": round(sum(densities) / max(1, len(densities)), 4)},
+    }
+    if durations:
+        rep["audio_duration"] = dict(
+            _quantiles(durations),
+            total_hours=round(sum(durations) / 3600, 2))
+    txt = json.dumps(rep, indent=2, ensure_ascii=False)
+    if args.report:
+        with open(args.report, "w", encoding="utf-8") as f:
+            f.write(txt)
+    print(txt)
+    print(f"\ndataset: {total} rows in {len(shard_lengths)} shard(s) -> {outdir}",
+          file=sys.stderr)
+    return 0
+
+
+def _hf_schema(pa, cols, sampling_rate):
+    """Arrow schema carrying the `datasets` feature block, so `audio` comes back
+    as an Audio column rather than a raw struct."""
+    features = {}
+    for name, arr in cols.items():
+        if name == "audio":
+            features[name] = {"sampling_rate": sampling_rate, "_type": "Audio"}
+        elif pa.types.is_string(arr.type):
+            features[name] = {"dtype": "string", "_type": "Value"}
+        elif pa.types.is_int64(arr.type):
+            features[name] = {"dtype": "int64", "_type": "Value"}
+        else:
+            features[name] = {"dtype": "float64", "_type": "Value"}
+    schema = pa.schema([(n, a.type) for n, a in cols.items()])
+    return schema.with_metadata({
+        "huggingface": json.dumps({"info": {"features": features}})})
+
+
+def _write_hf_metadata(outdir, schema, shard_lengths, total, split):
+    features = json.loads(
+        schema.metadata[b"huggingface"].decode())["info"]["features"]
+    with open(os.path.join(outdir, "dataset_info.json"), "w",
+              encoding="utf-8") as f:
+        json.dump({"builder_name": "persian_tts_frontend", "config_name":
+                   "default", "dataset_name": "persian_tts_frontend",
+                   "description": "", "citation": "", "homepage": "",
+                   "license": "", "features": features,
+                   "splits": {split: {"name": split, "num_examples": total,
+                                      "shard_lengths": shard_lengths,
+                                      "dataset_name": "persian_tts_frontend"}},
+                   "version": {"version_str": "1.0.0", "major": 1, "minor": 0,
+                               "patch": 0}},
+                  f, ensure_ascii=False, indent=2)
+    with open(os.path.join(outdir, "state.json"), "w", encoding="utf-8") as f:
+        json.dump({"_data_files": [{"filename": f"data-{i:05d}.arrow"}
+                                   for i in range(len(shard_lengths))],
+                   "_fingerprint": "ptf" + "%012x" % (total * 2654435761 % 2**48),
+                   "_format_columns": None, "_format_kwargs": {},
+                   "_format_type": None, "_output_all_columns": False,
+                   "_split": split}, f, ensure_ascii=False, indent=2)
 
 
 def run_inspect(args):
@@ -808,6 +1149,9 @@ def main(argv=None):
                    help="arrow/parquet only: pick one split of a DatasetDict")
     n.add_argument("--output", default=None)
     n.add_argument("--report", default=None)
+    n.add_argument("--output-arrow", default=None, metavar="PATH",
+                   help="also write the manifest as an Arrow IPC "
+                        "stream (datasets.Dataset.from_file)")
     n.add_argument("--audio-root", default=None)
     n.add_argument("--text-field", default="text")
     n.add_argument("--audio-field", default="audio")
@@ -847,6 +1191,52 @@ def main(argv=None):
     n.add_argument("--no-provenance", action="store_true")
     n.add_argument("--selftest", action="store_true")
     n.set_defaults(func=run_normalize)
+
+    b = sub.add_parser("build", help="write a full Arrow dataset: source audio "
+                                     "carried through, text normalized")
+    b.add_argument("--input", required=True)
+    b.add_argument("--output-dataset", required=True, metavar="DIR",
+                   help="save_to_disk() layout; load_from_disk() reads it")
+    b.add_argument("--report", default=None)
+    b.add_argument("--split", default=None)
+    b.add_argument("--text-field", default="text")
+    b.add_argument("--audio-field", default="audio")
+    b.add_argument("--duration-field", default="duration")
+    b.add_argument("--duration-from-audio", action="store_true")
+    b.add_argument("--sampling-rate", type=int, default=16000,
+                   help="declared on the Audio feature; must match the audio")
+    b.add_argument("--shard-mb", type=int, default=500,
+                   help="roll a new shard past this many MB (default 500)")
+    b.add_argument("--keep-fields", default=None, metavar="A,B")
+    b.add_argument("--min-field", action="append", default=[], metavar="NAME=V")
+    b.add_argument("--max-field", action="append", default=[], metavar="NAME=V")
+    b.add_argument("--drop-text-matching", default=None, metavar="REGEX")
+    b.add_argument("--min-duration", type=float, default=0.0, metavar="SEC")
+    b.add_argument("--max-duration", type=float, default=0.0, metavar="SEC")
+    b.add_argument("--min-words", type=int, default=2)
+    b.add_argument("--max-chars", type=int, default=600)
+    b.add_argument("--dataset-id", type=int, default=0)
+    b.add_argument("--tier", default="core",
+                   choices=["gold", "core", "diversity", "register",
+                            "emotion", "replay"])
+    b.add_argument("--strip-harakat", action="store_true")
+    b.add_argument("--keep-parens", action="store_true")
+    b.add_argument("--decimal-style", default="momayez",
+                   choices=["momayez", "fractional"])
+    b.add_argument("--latin-strategy", default="escalate",
+                   choices=["escalate", "lexicon", "transliterate"])
+    b.set_defaults(func=run_build)
+
+    t = sub.add_parser("try", help="normalize sentences from the command line "
+                                   "or stdin and show what changed")
+    t.add_argument("text", nargs="*", help="sentences; omit to read stdin")
+    t.add_argument("--strip-harakat", action="store_true")
+    t.add_argument("--keep-parens", action="store_true")
+    t.add_argument("--decimal-style", default="momayez",
+                   choices=["momayez", "fractional"])
+    t.add_argument("--latin-strategy", default="escalate",
+                   choices=["escalate", "lexicon", "transliterate"])
+    t.set_defaults(func=run_try)
 
     q = sub.add_parser("inspect",
                        help="show the schema + first rows of an arrow/parquet "
