@@ -199,9 +199,28 @@ ZWNJ_PREFIX_RE = re.compile(r"\b(ن?می) ([\u0600-\u06ff]{2,})")
 ZWNJ_SUFFIX_RE = re.compile(r"([\u0600-\u06ff]{2,}) (ها|های|هایی|تر|ترین|ام|ات|اش)\b")
 
 
+ZWNJ_SUFFIXES = ("ها", "های", "هایی", "تر", "ترین", "ام", "ات", "اش")
+
+
+def _join_suffix(m):
+    """Attach a detached suffix, unless it would chain onto one just attached.
+
+    A ZWNJ inside the stem is normal and must still join: "نرم‌افزار ها" ->
+    "نرم‌افزارها". But a stem that *is* a suffix and sits directly after a ZWNJ
+    was produced by this same rule on an earlier pass. The stuttered transcript
+    "شبکه ها ها" becomes "شبکه‌ها ها"; joining again fabricates "شبکه‌ها‌ها" --
+    a different string on every pass, so the text never satisfies idempotence.
+    """
+    stem, suffix = m.group(1), m.group(2)
+    if (stem in ZWNJ_SUFFIXES and m.start(1) > 0
+            and m.string[m.start(1) - 1] == ZWNJ):
+        return m.group(0)
+    return stem + ZWNJ + suffix
+
+
 def repair_zwnj(text: str) -> str:
     text = ZWNJ_PREFIX_RE.sub(rf"\1{ZWNJ}\2", text)
-    text = ZWNJ_SUFFIX_RE.sub(rf"\1{ZWNJ}\2", text)
+    text = ZWNJ_SUFFIX_RE.sub(_join_suffix, text)
     return text
 
 

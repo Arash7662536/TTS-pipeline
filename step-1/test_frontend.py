@@ -314,6 +314,22 @@ def test_version_stability():
     check("sys.modules[__name__]" in src, "version hash covers pipeline.py")
 
 
+def test_zwnj_suffix_does_not_chain():
+    """A stuttered "شبکه ها ها" joined one "ها" per pass, so the text was a
+    different string every time it went through -- found on the full corpus."""
+    nz = Normalizer()
+    once = nz("روی سایر شبکه ها ها نیست")
+    eq(nz(once), once, "doubled suffix is idempotent")
+    eq(once, "روی سایر شبکه‌ها ها نیست", "second ها stays detached")
+    # the ordinary repairs must be untouched, including stems holding a ZWNJ
+    eq(nz("کتاب ها را بردم"), "کتاب‌ها را بردم", "plain plural still joins")
+    eq(nz("بزرگ ترین شهر"), "بزرگ‌ترین شهر", "superlative still joins")
+    eq(nz("خانه ام را فروختم"), "خانه‌ام را فروختم", "possessive still joins")
+    check(ZWNJ in nz("نرم‌افزار ها را نصب کن"),
+          "stem containing a ZWNJ still takes its suffix",
+          nz("نرم‌افزار ها را نصب کن"), "joined")
+
+
 def test_unknown_chars_do_not_weld_words():
     """The charset guard replaces with a space, not "" -- deleting outright
     turned "۲×۳" into the fabricated word "دوسه"."""
@@ -433,6 +449,32 @@ def test_field_bounds_and_quantiles():
     eq(_quantiles([2.0])["median"], 2.0, "single value does not index past end")
 
 
+def test_wav_duration_from_header():
+    """Datasets with embedded audio and no duration column: read it from the
+    WAV header, without touching the payload."""
+    import io
+    import wave
+    from persian_tts_frontend.cli import _wav_duration
+
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(16000)
+        w.writeframes(b"\x00\x00" * 16000 * 7)
+    canonical = buf.getvalue()
+    eq(_wav_duration(canonical[:128]), 7.0, "canonical 16k mono header")
+
+    # an interleaved LIST chunk moves `data`; a fixed 44-byte guess mis-times it
+    patched = (canonical[:36] + b"LIST" + (10).to_bytes(4, "little")
+               + b"INFOxxxxxx" + canonical[36:])
+    patched = b"RIFF" + (len(patched) - 8).to_bytes(4, "little") + patched[8:]
+    eq(_wav_duration(patched[:128]), 7.0, "header with a LIST chunk")
+
+    for junk in [b"", b"ID3\x04junkjunkjunk", b"RIFF" + b"\x00" * 8]:
+        eq(_wav_duration(junk), None, "non-WAV yields no duration")
+
+
 def test_arrow_gating():
     """The thomclas shape: text + embedded audio + per-clip DNSMOS columns."""
     try:
@@ -464,6 +506,19 @@ def test_arrow_gating():
         rows2 = list(adapter_arrow(d, text_field="sentence",
                                    extra_fields=["nope"]))
         eq(rows2[0]["_extra"], {}, "absent extra column yields no key")
+
+        # Row locators must restart per shard -- they name a file and an index
+        # into *that* file, so a cumulative counter points at the wrong row.
+        second = Path(d) / "data-00001-of-00002.arrow"
+        with pa.OSFile(str(second), "wb") as sink:
+            w = pa.ipc.new_stream(sink, tbl.schema)
+            w.write_table(tbl)
+            w.close()
+        locators = [r["audio"] for r in adapter_arrow(d, text_field="sentence")]
+        eq(len(locators), 4, "two shards read")
+        check(locators[2].endswith("#row=0") and locators[3].endswith("#row=1"),
+              "locator index restarts on the second shard",
+              locators[2:], "...#row=0, ...#row=1")
 
 
 # ------------------------------------------------------------------ runner

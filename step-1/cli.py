@@ -290,9 +290,51 @@ def _as_float(v):
         return None
 
 
+def _wav_duration(head):
+    """Seconds from a WAV header prefix, or None if it is not parseable PCM.
+
+    Reads the `fmt ` and `data` chunk descriptors rather than assuming the
+    canonical 44-byte layout -- encoders interleave `LIST`/`fact` chunks, and
+    guessing the offset would silently mis-time those files. The `data` chunk
+    carries its own byte count, so the payload never has to be touched.
+    """
+    if not head or len(head) < 16 or head[:4] != b"RIFF" or head[8:12] != b"WAVE":
+        return None
+    import struct
+    pos, rate, channels, bits = 12, None, None, None
+    while pos + 8 <= len(head):
+        cid = head[pos:pos + 4]
+        size = int.from_bytes(head[pos + 4:pos + 8], "little")
+        body = pos + 8
+        if cid == b"fmt " and body + 16 <= len(head):
+            _, channels, rate, _, _, bits = struct.unpack_from("<HHIIHH", head, body)
+        elif cid == b"data":
+            if not (rate and channels and bits):
+                return None
+            per_sec = rate * channels * (bits // 8)
+            return (size / per_sec) if per_sec else None
+        pos = body + size + (size & 1)
+    return None
+
+
+def _audio_durations(pa, arr, n):
+    """Durations for a struct<bytes, ...> audio column, read from the WAV
+    headers only. `binary_slice` keeps this to the first bytes of each blob, so
+    a 45 GB corpus is scanned without decoding any audio."""
+    if arr is None or not pa.types.is_struct(arr.type):
+        return [None] * n
+    members = [f.name for f in arr.type]
+    if "bytes" not in members:
+        return [None] * n
+    import pyarrow.compute as pc
+    heads = pc.binary_slice(arr.field("bytes"), 0, 128).to_pylist()
+    return [_wav_duration(h) for h in heads]
+
+
 def adapter_arrow(path, audio_root=None, text_field="text",
                   audio_field="audio", speaker_field=None,
-                  duration_field="duration", split=None, extra_fields=()):
+                  duration_field="duration", split=None, extra_fields=(),
+                  duration_from_audio=False):
     """Arrow / HuggingFace `datasets` dataset.
 
     Only the columns named by the field flags are converted to Python, so a
@@ -319,8 +361,10 @@ def adapter_arrow(path, audio_root=None, text_field="text",
             warned.add(key)
             print(f"!! {msg}", file=sys.stderr)
 
-    row_no = 0
     for fp in files:
+        # Per-file, not cumulative: the locator pairs a filename with an index,
+        # so the index has to be the one you would pass to that file's reader.
+        row_no = 0
         for batch in _arrow_batches(pa, fp):
             n = batch.num_rows
             if not n:
@@ -356,10 +400,21 @@ def adapter_arrow(path, audio_root=None, text_field="text",
                 spks = [None] * n
 
             dur_col = _column(pa, batch, duration_field)
-            if dur_col is None and duration_field:
-                warn("duration", f"no {duration_field!r} column -- "
-                                 "speaker-hours will be empty")
-            durs = dur_col.to_pylist() if dur_col is not None else [None] * n
+            if dur_col is not None:
+                durs = dur_col.to_pylist()
+            elif duration_from_audio:
+                durs = _audio_durations(pa, audio_col, n)
+                if not any(d for d in durs):
+                    warn("duration_audio",
+                         "--duration-from-audio found no readable WAV header "
+                         f"in {audio_field!r} -- durations stay empty")
+            else:
+                if duration_field:
+                    warn("duration", f"no {duration_field!r} column -- "
+                                     "speaker-hours will be empty; pass "
+                                     "--duration-from-audio to read it from "
+                                     "the audio headers")
+                durs = [None] * n
 
             extras = {}
             for name in extra_fields:
@@ -427,7 +482,8 @@ def run_normalize(args):
                       speaker_field=args.speaker_field,
                       duration_field=args.duration_field)
     if args.adapter in ("arrow", "parquet"):
-        kwargs.update(split=args.split, extra_fields=wanted)
+        kwargs.update(split=args.split, extra_fields=wanted,
+                      duration_from_audio=args.duration_from_audio)
     rows = adapter(args.input, **kwargs)
 
     stats = Counter()
@@ -438,6 +494,7 @@ def run_normalize(args):
     densities = []
     samples_for_selftest = []
     dropped_examples = []
+    durations_kept = []
     # Distribution of every gated/kept numeric column, over the rows that
     # survived -- this is what you read to choose the next threshold.
     field_values = defaultdict(list)
@@ -505,6 +562,20 @@ def run_normalize(args):
                     dropped_examples.append({"reason": "too_long",
                                              "chars": len(res.text)})
                 continue
+            dur = r.get("duration")
+            if args.min_duration or args.max_duration:
+                if dur is None:
+                    stats["drop_duration_unknown"] += 1
+                    continue
+                if args.min_duration and dur < args.min_duration:
+                    stats["drop_too_short_audio"] += 1
+                    continue
+                if args.max_duration and dur > args.max_duration:
+                    stats["drop_too_long_audio"] += 1
+                    if len(dropped_examples) < 10:
+                        dropped_examples.append({"reason": "audio_too_long",
+                                                 "seconds": round(dur, 2)})
+                    continue
             if args.require_audio and not os.path.exists(r["audio"]):
                 stats["drop_missing_audio"] += 1
                 if len(dropped_examples) < 10:
@@ -514,6 +585,8 @@ def run_normalize(args):
 
             stats["kept"] += 1
             densities.append(res.diacritic_density)
+            if dur:
+                durations_kept.append(dur)
             for name in wanted:
                 v = _as_number(extra.get(name))
                 if v is not None:
@@ -521,13 +594,13 @@ def run_normalize(args):
             spk = r.get("speaker") or args.default_speaker
             if spk:
                 speakers[spk] += 1
-                if r.get("duration"):
-                    speaker_seconds[spk] += r["duration"]
+                if dur:
+                    speaker_seconds[spk] += dur
 
             if out:
                 row = {"audio": r["audio"], "text": res.text}
-                if r.get("duration"):
-                    row["duration"] = round(float(r["duration"]), 3)
+                if dur:
+                    row["duration"] = round(float(dur), 3)
                 row["dataset_id"] = args.dataset_id
                 if not args.no_provenance:
                     row["text_raw"] = raw
@@ -577,6 +650,10 @@ def run_normalize(args):
     if field_values:
         rep["field_stats"] = {name: _quantiles(v)
                               for name, v in sorted(field_values.items())}
+
+    if durations_kept:
+        rep["audio_duration"] = dict(_quantiles(durations_kept),
+                                     total_hours=round(sum(durations_kept) / 3600, 2))
 
     if args.selftest:
         rep["selftest_failures"] = {
@@ -745,6 +822,11 @@ def main(argv=None):
     n.add_argument("--min-words", type=int, default=2)
     n.add_argument("--max-chars", type=int, default=600)
     n.add_argument("--require-audio", action="store_true")
+    n.add_argument("--duration-from-audio", action="store_true",
+                   help="arrow/parquet: derive duration from the embedded "
+                        "audio's WAV header when there is no duration column")
+    n.add_argument("--min-duration", type=float, default=0.0, metavar="SEC")
+    n.add_argument("--max-duration", type=float, default=0.0, metavar="SEC")
     n.add_argument("--strip-harakat", action="store_true")
     n.add_argument("--keep-parens", action="store_true")
     n.add_argument("--decimal-style", default="momayez",

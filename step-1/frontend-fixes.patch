@@ -1,6 +1,6 @@
 diff -urN orig/persian_tts_frontend/cli.py new/persian_tts_frontend/cli.py
 --- a/persian_tts_frontend/cli.py	2026-07-31 16:14:05.000000000 +0100
-+++ b/persian_tts_frontend/cli.py	2026-08-01 10:42:00.718529292 +0100
++++ b/persian_tts_frontend/cli.py	2026-08-01 15:47:02.312692188 +0100
 @@ -15,6 +15,15 @@
          --output /data/fidibo/manifest.jsonl --dataset-id 1 \
          --tier core --speaker-field narrator
@@ -28,7 +28,7 @@ diff -urN orig/persian_tts_frontend/cli.py new/persian_tts_frontend/cli.py
  import sys
  from collections import Counter, defaultdict
  
-@@ -125,14 +136,271 @@
+@@ -125,14 +136,326 @@
                     "duration": None, "speaker": None, "_extra": {}}
  
  
@@ -186,9 +186,51 @@ diff -urN orig/persian_tts_frontend/cli.py new/persian_tts_frontend/cli.py
 +        return None
 +
 +
++def _wav_duration(head):
++    """Seconds from a WAV header prefix, or None if it is not parseable PCM.
++
++    Reads the `fmt ` and `data` chunk descriptors rather than assuming the
++    canonical 44-byte layout -- encoders interleave `LIST`/`fact` chunks, and
++    guessing the offset would silently mis-time those files. The `data` chunk
++    carries its own byte count, so the payload never has to be touched.
++    """
++    if not head or len(head) < 16 or head[:4] != b"RIFF" or head[8:12] != b"WAVE":
++        return None
++    import struct
++    pos, rate, channels, bits = 12, None, None, None
++    while pos + 8 <= len(head):
++        cid = head[pos:pos + 4]
++        size = int.from_bytes(head[pos + 4:pos + 8], "little")
++        body = pos + 8
++        if cid == b"fmt " and body + 16 <= len(head):
++            _, channels, rate, _, _, bits = struct.unpack_from("<HHIIHH", head, body)
++        elif cid == b"data":
++            if not (rate and channels and bits):
++                return None
++            per_sec = rate * channels * (bits // 8)
++            return (size / per_sec) if per_sec else None
++        pos = body + size + (size & 1)
++    return None
++
++
++def _audio_durations(pa, arr, n):
++    """Durations for a struct<bytes, ...> audio column, read from the WAV
++    headers only. `binary_slice` keeps this to the first bytes of each blob, so
++    a 45 GB corpus is scanned without decoding any audio."""
++    if arr is None or not pa.types.is_struct(arr.type):
++        return [None] * n
++    members = [f.name for f in arr.type]
++    if "bytes" not in members:
++        return [None] * n
++    import pyarrow.compute as pc
++    heads = pc.binary_slice(arr.field("bytes"), 0, 128).to_pylist()
++    return [_wav_duration(h) for h in heads]
++
++
 +def adapter_arrow(path, audio_root=None, text_field="text",
 +                  audio_field="audio", speaker_field=None,
-+                  duration_field="duration", split=None, extra_fields=()):
++                  duration_field="duration", split=None, extra_fields=(),
++                  duration_from_audio=False):
 +    """Arrow / HuggingFace `datasets` dataset.
 +
 +    Only the columns named by the field flags are converted to Python, so a
@@ -215,8 +257,10 @@ diff -urN orig/persian_tts_frontend/cli.py new/persian_tts_frontend/cli.py
 +            warned.add(key)
 +            print(f"!! {msg}", file=sys.stderr)
 +
-+    row_no = 0
 +    for fp in files:
++        # Per-file, not cumulative: the locator pairs a filename with an index,
++        # so the index has to be the one you would pass to that file's reader.
++        row_no = 0
 +        for batch in _arrow_batches(pa, fp):
 +            n = batch.num_rows
 +            if not n:
@@ -252,10 +296,21 @@ diff -urN orig/persian_tts_frontend/cli.py new/persian_tts_frontend/cli.py
 +                spks = [None] * n
 +
 +            dur_col = _column(pa, batch, duration_field)
-+            if dur_col is None and duration_field:
-+                warn("duration", f"no {duration_field!r} column -- "
-+                                 "speaker-hours will be empty")
-+            durs = dur_col.to_pylist() if dur_col is not None else [None] * n
++            if dur_col is not None:
++                durs = dur_col.to_pylist()
++            elif duration_from_audio:
++                durs = _audio_durations(pa, audio_col, n)
++                if not any(d for d in durs):
++                    warn("duration_audio",
++                         "--duration-from-audio found no readable WAV header "
++                         f"in {audio_field!r} -- durations stay empty")
++            else:
++                if duration_field:
++                    warn("duration", f"no {duration_field!r} column -- "
++                                     "speaker-hours will be empty; pass "
++                                     "--duration-from-audio to read it from "
++                                     "the audio headers")
++                durs = [None] * n
 +
 +            extras = {}
 +            for name in extra_fields:
@@ -300,7 +355,7 @@ diff -urN orig/persian_tts_frontend/cli.py new/persian_tts_frontend/cli.py
  
  # ------------------------------------------------------------------ main pass
  
-@@ -146,12 +414,20 @@
+@@ -146,12 +469,21 @@
      nz = Normalizer(config=cfg)
      print(f"frontend version: {nz.version}", file=sys.stderr)
  
@@ -318,21 +373,23 @@ diff -urN orig/persian_tts_frontend/cli.py new/persian_tts_frontend/cli.py
                        speaker_field=args.speaker_field,
                        duration_field=args.duration_field)
 +    if args.adapter in ("arrow", "parquet"):
-+        kwargs.update(split=args.split, extra_fields=wanted)
++        kwargs.update(split=args.split, extra_fields=wanted,
++                      duration_from_audio=args.duration_from_audio)
      rows = adapter(args.input, **kwargs)
  
      stats = Counter()
-@@ -162,6 +438,9 @@
+@@ -162,6 +494,10 @@
      densities = []
      samples_for_selftest = []
      dropped_examples = []
++    durations_kept = []
 +    # Distribution of every gated/kept numeric column, over the rows that
 +    # survived -- this is what you read to choose the next threshold.
 +    field_values = defaultdict(list)
  
      out = open(args.output, "w", encoding="utf-8") if args.output else None
      try:
-@@ -178,6 +457,29 @@
+@@ -178,6 +514,29 @@
                  stats["drop_empty_source"] += 1
                  continue
  
@@ -362,10 +419,33 @@ diff -urN orig/persian_tts_frontend/cli.py new/persian_tts_frontend/cli.py
              res = nz.normalize(raw)
  
              if len(samples_for_selftest) < 2000:
-@@ -212,6 +514,10 @@
+@@ -203,6 +562,20 @@
+                     dropped_examples.append({"reason": "too_long",
+                                              "chars": len(res.text)})
+                 continue
++            dur = r.get("duration")
++            if args.min_duration or args.max_duration:
++                if dur is None:
++                    stats["drop_duration_unknown"] += 1
++                    continue
++                if args.min_duration and dur < args.min_duration:
++                    stats["drop_too_short_audio"] += 1
++                    continue
++                if args.max_duration and dur > args.max_duration:
++                    stats["drop_too_long_audio"] += 1
++                    if len(dropped_examples) < 10:
++                        dropped_examples.append({"reason": "audio_too_long",
++                                                 "seconds": round(dur, 2)})
++                    continue
+             if args.require_audio and not os.path.exists(r["audio"]):
+                 stats["drop_missing_audio"] += 1
+                 if len(dropped_examples) < 10:
+@@ -212,16 +585,22 @@
  
              stats["kept"] += 1
              densities.append(res.diacritic_density)
++            if dur:
++                durations_kept.append(dur)
 +            for name in wanted:
 +                v = _as_number(extra.get(name))
 +                if v is not None:
@@ -373,7 +453,21 @@ diff -urN orig/persian_tts_frontend/cli.py new/persian_tts_frontend/cli.py
              spk = r.get("speaker") or args.default_speaker
              if spk:
                  speakers[spk] += 1
-@@ -230,6 +536,10 @@
+-                if r.get("duration"):
+-                    speaker_seconds[spk] += r["duration"]
++                if dur:
++                    speaker_seconds[spk] += dur
+ 
+             if out:
+                 row = {"audio": r["audio"], "text": res.text}
+-                if r.get("duration"):
+-                    row["duration"] = round(float(r["duration"]), 3)
++                if dur:
++                    row["duration"] = round(float(dur), 3)
+                 row["dataset_id"] = args.dataset_id
+                 if not args.no_provenance:
+                     row["text_raw"] = raw
+@@ -230,6 +609,10 @@
                      row["diacritic_density"] = round(res.diacritic_density, 4)
                      if spk:
                          row["speaker"] = spk
@@ -384,7 +478,7 @@ diff -urN orig/persian_tts_frontend/cli.py new/persian_tts_frontend/cli.py
                  out.write(json.dumps(row, ensure_ascii=False) + "\n")
      finally:
          if out:
-@@ -264,6 +574,10 @@
+@@ -264,6 +647,14 @@
          "dropped_examples": dropped_examples,
      }
  
@@ -392,10 +486,14 @@ diff -urN orig/persian_tts_frontend/cli.py new/persian_tts_frontend/cli.py
 +        rep["field_stats"] = {name: _quantiles(v)
 +                              for name, v in sorted(field_values.items())}
 +
++    if durations_kept:
++        rep["audio_duration"] = dict(_quantiles(durations_kept),
++                                     total_hours=round(sum(durations_kept) / 3600, 2))
++
      if args.selftest:
          rep["selftest_failures"] = {
              k: (len(v), v[:5]) for k, v in
-@@ -287,6 +601,112 @@
+@@ -287,6 +678,112 @@
      return 0
  
  
@@ -508,7 +606,7 @@ diff -urN orig/persian_tts_frontend/cli.py new/persian_tts_frontend/cli.py
  def _skew(counts):
      """Crude concentration measure: share of rows held by the top 10% of
      speakers. Above ~0.5 means you need the per-narrator cap."""
-@@ -304,8 +724,11 @@
+@@ -304,8 +801,11 @@
      sub = p.add_subparsers(dest="cmd", required=True)
  
      n = sub.add_parser("normalize", help="normalize a corpus into a manifest")
@@ -521,7 +619,18 @@ diff -urN orig/persian_tts_frontend/cli.py new/persian_tts_frontend/cli.py
      n.add_argument("--output", default=None)
      n.add_argument("--report", default=None)
      n.add_argument("--audio-root", default=None)
-@@ -328,10 +751,29 @@
+@@ -322,16 +822,40 @@
+     n.add_argument("--min-words", type=int, default=2)
+     n.add_argument("--max-chars", type=int, default=600)
+     n.add_argument("--require-audio", action="store_true")
++    n.add_argument("--duration-from-audio", action="store_true",
++                   help="arrow/parquet: derive duration from the embedded "
++                        "audio's WAV header when there is no duration column")
++    n.add_argument("--min-duration", type=float, default=0.0, metavar="SEC")
++    n.add_argument("--max-duration", type=float, default=0.0, metavar="SEC")
+     n.add_argument("--strip-harakat", action="store_true")
+     n.add_argument("--keep-parens", action="store_true")
+     n.add_argument("--decimal-style", default="momayez",
                     choices=["momayez", "fractional"])
      n.add_argument("--latin-strategy", default="escalate",
                     choices=["escalate", "lexicon", "transliterate"])
@@ -553,7 +662,7 @@ diff -urN orig/persian_tts_frontend/cli.py new/persian_tts_frontend/cli.py
  
 diff -urN orig/persian_tts_frontend/expand.py new/persian_tts_frontend/expand.py
 --- a/persian_tts_frontend/expand.py	2026-07-31 16:14:05.000000000 +0100
-+++ b/persian_tts_frontend/expand.py	2026-08-01 10:42:00.718529292 +0100
++++ b/persian_tts_frontend/expand.py	2026-08-01 15:47:02.312692188 +0100
 @@ -9,7 +9,8 @@
  import re
  
@@ -639,7 +748,7 @@ diff -urN orig/persian_tts_frontend/expand.py new/persian_tts_frontend/expand.py
          "phone": expand_phone,
 diff -urN orig/persian_tts_frontend/normalize.py new/persian_tts_frontend/normalize.py
 --- a/persian_tts_frontend/normalize.py	2026-07-31 16:14:05.000000000 +0100
-+++ b/persian_tts_frontend/normalize.py	2026-08-01 10:42:00.718529292 +0100
++++ b/persian_tts_frontend/normalize.py	2026-08-01 15:47:02.312692188 +0100
 @@ -145,6 +145,15 @@
      `ها`/`تر`/`ترین` suffixes.
      """
@@ -669,9 +778,39 @@ diff -urN orig/persian_tts_frontend/normalize.py new/persian_tts_frontend/normal
      return text.strip()
  
  
+@@ -196,9 +199,28 @@
+ ZWNJ_SUFFIX_RE = re.compile(r"([\u0600-\u06ff]{2,}) (ها|های|هایی|تر|ترین|ام|ات|اش)\b")
+ 
+ 
++ZWNJ_SUFFIXES = ("ها", "های", "هایی", "تر", "ترین", "ام", "ات", "اش")
++
++
++def _join_suffix(m):
++    """Attach a detached suffix, unless it would chain onto one just attached.
++
++    A ZWNJ inside the stem is normal and must still join: "نرم‌افزار ها" ->
++    "نرم‌افزارها". But a stem that *is* a suffix and sits directly after a ZWNJ
++    was produced by this same rule on an earlier pass. The stuttered transcript
++    "شبکه ها ها" becomes "شبکه‌ها ها"; joining again fabricates "شبکه‌ها‌ها" --
++    a different string on every pass, so the text never satisfies idempotence.
++    """
++    stem, suffix = m.group(1), m.group(2)
++    if (stem in ZWNJ_SUFFIXES and m.start(1) > 0
++            and m.string[m.start(1) - 1] == ZWNJ):
++        return m.group(0)
++    return stem + ZWNJ + suffix
++
++
+ def repair_zwnj(text: str) -> str:
+     text = ZWNJ_PREFIX_RE.sub(rf"\1{ZWNJ}\2", text)
+-    text = ZWNJ_SUFFIX_RE.sub(rf"\1{ZWNJ}\2", text)
++    text = ZWNJ_SUFFIX_RE.sub(_join_suffix, text)
+     return text
+ 
+ 
 diff -urN orig/persian_tts_frontend/numbers.py new/persian_tts_frontend/numbers.py
 --- a/persian_tts_frontend/numbers.py	2026-07-31 16:14:05.000000000 +0100
-+++ b/persian_tts_frontend/numbers.py	2026-08-01 10:42:00.718529292 +0100
++++ b/persian_tts_frontend/numbers.py	2026-08-01 15:47:02.312692188 +0100
 @@ -10,6 +10,7 @@
  
  ZERO = "صفر"
@@ -682,7 +821,7 @@ diff -urN orig/persian_tts_frontend/numbers.py new/persian_tts_frontend/numbers.
  ONES = ["", "یک", "دو", "سه", "چهار", "پنج", "شش", "هفت", "هشت", "نه"]
 diff -urN orig/persian_tts_frontend/pipeline.py new/persian_tts_frontend/pipeline.py
 --- a/persian_tts_frontend/pipeline.py	2026-07-31 16:14:05.000000000 +0100
-+++ b/persian_tts_frontend/pipeline.py	2026-08-01 10:42:00.718529292 +0100
++++ b/persian_tts_frontend/pipeline.py	2026-08-01 15:47:02.312692188 +0100
 @@ -11,6 +11,7 @@
  import inspect
  import json
@@ -729,7 +868,7 @@ diff -urN orig/persian_tts_frontend/pipeline.py new/persian_tts_frontend/pipelin
          # 10. escapes back
 diff -urN orig/pyproject.toml new/pyproject.toml
 --- a/pyproject.toml	2026-07-31 16:14:06.000000000 +0100
-+++ b/pyproject.toml	2026-08-01 10:42:00.718529292 +0100
++++ b/pyproject.toml	2026-08-01 15:47:02.312692188 +0100
 @@ -7,10 +7,11 @@
  version = "1.0.0"
  description = "Persian text normalization frontend for VoxCPM 2 fine-tuning"
@@ -746,7 +885,7 @@ diff -urN orig/pyproject.toml new/pyproject.toml
  packages = ["persian_tts_frontend"]
 diff -urN orig/README.md new/README.md
 --- a/README.md	2026-07-31 16:14:06.000000000 +0100
-+++ b/README.md	2026-08-01 10:42:00.718529292 +0100
++++ b/README.md	2026-08-01 15:47:02.312692188 +0100
 @@ -63,9 +63,66 @@
      --output /data/manifests/cv.jsonl --dataset-id 3 --tier diversity
  ```
@@ -828,7 +967,7 @@ diff -urN orig/README.md new/README.md
  scripts/run_audit.py
 diff -urN orig/tests/test_frontend.py new/tests/test_frontend.py
 --- a/tests/test_frontend.py	2026-07-31 16:14:05.000000000 +0100
-+++ b/tests/test_frontend.py	2026-08-01 10:42:00.718529292 +0100
++++ b/tests/test_frontend.py	2026-08-01 15:47:02.312692188 +0100
 @@ -112,6 +112,78 @@
            "no ASCII digits survive expansion")
  
@@ -908,7 +1047,7 @@ diff -urN orig/tests/test_frontend.py new/tests/test_frontend.py
  def test_punctuation():
      nz = Normalizer()
      check("\u060c" in nz("سلام, خوبی"), "ASCII comma -> Persian comma")
-@@ -233,6 +305,25 @@
+@@ -233,6 +305,41 @@
      check(c.version != a.version, "config change alters version",
            c.version, f"!= {a.version}")
      check(a.version.startswith("fa-fe-"), "version prefix", a.version, "fa-fe-*")
@@ -919,6 +1058,22 @@ diff -urN orig/tests/test_frontend.py new/tests/test_frontend.py
 +    from persian_tts_frontend import pipeline as _p
 +    src = _i.getsource(_p)
 +    check("sys.modules[__name__]" in src, "version hash covers pipeline.py")
++
++
++def test_zwnj_suffix_does_not_chain():
++    """A stuttered "شبکه ها ها" joined one "ها" per pass, so the text was a
++    different string every time it went through -- found on the full corpus."""
++    nz = Normalizer()
++    once = nz("روی سایر شبکه ها ها نیست")
++    eq(nz(once), once, "doubled suffix is idempotent")
++    eq(once, "روی سایر شبکه‌ها ها نیست", "second ها stays detached")
++    # the ordinary repairs must be untouched, including stems holding a ZWNJ
++    eq(nz("کتاب ها را بردم"), "کتاب‌ها را بردم", "plain plural still joins")
++    eq(nz("بزرگ ترین شهر"), "بزرگ‌ترین شهر", "superlative still joins")
++    eq(nz("خانه ام را فروختم"), "خانه‌ام را فروختم", "possessive still joins")
++    check(ZWNJ in nz("نرم‌افزار ها را نصب کن"),
++          "stem containing a ZWNJ still takes its suffix",
++          nz("نرم‌افزار ها را نصب کن"), "joined")
 +
 +
 +def test_unknown_chars_do_not_weld_words():
@@ -934,7 +1089,7 @@ diff -urN orig/tests/test_frontend.py new/tests/test_frontend.py
  
  
  def test_latin_resolution():
-@@ -248,6 +339,133 @@
+@@ -248,6 +355,172 @@
            "transliterate leaves no Latin", nz3("برند Sharp"), "no ascii")
  
  
@@ -1032,6 +1187,32 @@ diff -urN orig/tests/test_frontend.py new/tests/test_frontend.py
 +    eq(_quantiles([2.0])["median"], 2.0, "single value does not index past end")
 +
 +
++def test_wav_duration_from_header():
++    """Datasets with embedded audio and no duration column: read it from the
++    WAV header, without touching the payload."""
++    import io
++    import wave
++    from persian_tts_frontend.cli import _wav_duration
++
++    buf = io.BytesIO()
++    with wave.open(buf, "wb") as w:
++        w.setnchannels(1)
++        w.setsampwidth(2)
++        w.setframerate(16000)
++        w.writeframes(b"\x00\x00" * 16000 * 7)
++    canonical = buf.getvalue()
++    eq(_wav_duration(canonical[:128]), 7.0, "canonical 16k mono header")
++
++    # an interleaved LIST chunk moves `data`; a fixed 44-byte guess mis-times it
++    patched = (canonical[:36] + b"LIST" + (10).to_bytes(4, "little")
++               + b"INFOxxxxxx" + canonical[36:])
++    patched = b"RIFF" + (len(patched) - 8).to_bytes(4, "little") + patched[8:]
++    eq(_wav_duration(patched[:128]), 7.0, "header with a LIST chunk")
++
++    for junk in [b"", b"ID3\x04junkjunkjunk", b"RIFF" + b"\x00" * 8]:
++        eq(_wav_duration(junk), None, "non-WAV yields no duration")
++
++
 +def test_arrow_gating():
 +    """The thomclas shape: text + embedded audio + per-clip DNSMOS columns."""
 +    try:
@@ -1063,6 +1244,19 @@ diff -urN orig/tests/test_frontend.py new/tests/test_frontend.py
 +        rows2 = list(adapter_arrow(d, text_field="sentence",
 +                                   extra_fields=["nope"]))
 +        eq(rows2[0]["_extra"], {}, "absent extra column yields no key")
++
++        # Row locators must restart per shard -- they name a file and an index
++        # into *that* file, so a cumulative counter points at the wrong row.
++        second = Path(d) / "data-00001-of-00002.arrow"
++        with pa.OSFile(str(second), "wb") as sink:
++            w = pa.ipc.new_stream(sink, tbl.schema)
++            w.write_table(tbl)
++            w.close()
++        locators = [r["audio"] for r in adapter_arrow(d, text_field="sentence")]
++        eq(len(locators), 4, "two shards read")
++        check(locators[2].endswith("#row=0") and locators[3].endswith("#row=1"),
++              "locator index restarts on the second shard",
++              locators[2:], "...#row=0, ...#row=1")
 +
 +
  # ------------------------------------------------------------------ runner
