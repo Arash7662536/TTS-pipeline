@@ -389,6 +389,64 @@ def test_arrow_adapter():
                   "message naming the available columns")
 
 
+def test_field_bounds_and_quantiles():
+    from persian_tts_frontend.cli import _parse_bounds, _quantiles, _as_number
+
+    eq(_parse_bounds(["mos_ovr=3.5"], []), {"mos_ovr": (3.5, None)}, "min only")
+    eq(_parse_bounds([], ["wer=0.2"]), {"wer": (None, 0.2)}, "max only")
+    eq(_parse_bounds(["a=1"], ["a=9"]), {"a": (1.0, 9.0)}, "both ends of one field")
+    for bad in ["mos_ovr", "mos_ovr=high", "=3"]:
+        try:
+            _parse_bounds([bad], [])
+            check(False, f"bad bound rejected: {bad}")
+        except SystemExit:
+            pass
+    # a numeric string is a number; a bool is not a score
+    eq(_as_number("3.5"), 3.5, "numeric string")
+    eq(_as_number(True), None, "bool is not a score")
+    eq(_as_number(None), None, "null is not a score")
+
+    q = _quantiles([1.0, 2.0, 3.0, 4.0, 5.0])
+    eq(q["n"], 5, "quantile count")
+    eq(q["min"], 1.0, "quantile min")
+    eq(q["max"], 5.0, "quantile max")
+    eq(q["median"], 3.0, "quantile median")
+    eq(_quantiles([2.0])["median"], 2.0, "single value does not index past end")
+
+
+def test_arrow_gating():
+    """The thomclas shape: text + embedded audio + per-clip DNSMOS columns."""
+    try:
+        import pyarrow as pa
+    except ImportError:
+        return
+    import tempfile
+    from persian_tts_frontend.cli import adapter_arrow
+
+    with tempfile.TemporaryDirectory() as d:
+        tbl = pa.table({
+            "sentence": pa.array(["جمله اول است", "جمله دوم است"]),
+            "audio": pa.array([{"bytes": b"RIFF", "path": None}] * 2,
+                              type=pa.struct([("bytes", pa.binary()),
+                                              ("path", pa.string())])),
+            "mos_ovr": pa.array([4.25, 1.75], type=pa.float64()),
+        })
+        with pa.OSFile(str(Path(d) / "data-00000-of-00001.arrow"), "wb") as sink:
+            w = pa.ipc.new_stream(sink, tbl.schema)
+            w.write_table(tbl)
+            w.close()
+
+        rows = list(adapter_arrow(d, text_field="sentence",
+                                  extra_fields=["mos_ovr"]))
+        eq(len(rows), 2, "gated adapter: row count")
+        eq(rows[0]["_extra"]["mos_ovr"], 4.25, "extra column reaches _extra")
+        eq(rows[1]["_extra"]["mos_ovr"], 1.75, "extra column per row")
+        # a column that is not there must not crash the pass
+        rows2 = list(adapter_arrow(d, text_field="sentence",
+                                   extra_fields=["nope"]))
+        eq(rows2[0]["_extra"], {}, "absent extra column yields no key")
+
+
 # ------------------------------------------------------------------ runner
 
 def main():

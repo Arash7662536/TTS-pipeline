@@ -92,6 +92,31 @@ Files are memory-mapped and **only the columns you name are converted to
 Python**, so the audio payload is never faulted in: a 300 MB dataset normalizes
 at ~75 MB RSS. Dotted names reach into structs (`--audio-field audio.path`).
 
+### Gating on per-clip quality columns
+
+Datasets that ship DNSMOS (or any other numeric per-clip score) can be filtered
+and have the score carried into the manifest:
+
+```bash
+python -m persian_tts_frontend.cli normalize \
+    --input /data/thom_arrow --adapter arrow --text-field sentence \
+    --keep-fields mos_ovr,mos_p808 \
+    --min-field mos_ovr=3.5 --min-field mos_p808=3.4 \
+    --drop-text-matching '\-\->|\d{2}:\d{2}:\d{2}[,.]\d{3}' \
+    --output /data/manifests/thom.jsonl --report /data/manifests/thom.json
+```
+
+`--min-field`/`--max-field` are repeatable and take `NAME=VALUE`; naming a
+column in either implies reading it. Rows missing the column are dropped and
+counted separately (`drop_<name>_missing`) rather than silently kept.
+`--drop-text-matching` takes a regex against the **raw** text — use it for
+subtitle timecodes, boilerplate, and other source junk that normalization
+cannot repair.
+
+Run once with `--keep-fields` and no gate first: the report grows a
+`field_stats` block (min/p10/p25/median/p75/p90/max) over the kept rows, which
+is what you read to choose the threshold.
+
 An `audio` column of `struct<bytes, path>` with a null `path` — i.e. audio
 embedded in the Arrow file, with no file on disk — yields a
 `<file>#row=N` locator in the manifest instead of a path. Those rows are

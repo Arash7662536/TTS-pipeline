@@ -1,6 +1,6 @@
 diff -urN orig/persian_tts_frontend/cli.py new/persian_tts_frontend/cli.py
 --- a/persian_tts_frontend/cli.py	2026-07-31 16:14:05.000000000 +0100
-+++ b/persian_tts_frontend/cli.py	2026-08-01 09:08:52.179223810 +0100
++++ b/persian_tts_frontend/cli.py	2026-08-01 10:27:25.288131810 +0100
 @@ -15,6 +15,15 @@
          --output /data/fidibo/manifest.jsonl --dataset-id 1 \
          --tier core --speaker-field narrator
@@ -17,15 +17,18 @@ diff -urN orig/persian_tts_frontend/cli.py new/persian_tts_frontend/cli.py
      # Common Voice (diversity tier)
      python -m persian_tts_frontend.cli normalize \
          --input /data/cv-fa/validated.tsv --adapter commonvoice \
-@@ -30,6 +39,7 @@
+@@ -30,8 +39,10 @@
  
  import argparse
  import csv
 +import glob
  import json
  import os
++import re
  import sys
-@@ -125,14 +135,257 @@
+ from collections import Counter, defaultdict
+ 
+@@ -125,14 +136,271 @@
                     "duration": None, "speaker": None, "_extra": {}}
  
  
@@ -185,7 +188,7 @@ diff -urN orig/persian_tts_frontend/cli.py new/persian_tts_frontend/cli.py
 +
 +def adapter_arrow(path, audio_root=None, text_field="text",
 +                  audio_field="audio", speaker_field=None,
-+                  duration_field="duration", split=None):
++                  duration_field="duration", split=None, extra_fields=()):
 +    """Arrow / HuggingFace `datasets` dataset.
 +
 +    Only the columns named by the field flags are converted to Python, so a
@@ -193,6 +196,11 @@ diff -urN orig/persian_tts_frontend/cli.py new/persian_tts_frontend/cli.py
 +    column. Rows whose audio is embedded (struct<bytes, path> with no path) get
 +    a `<file>#row=N` locator instead of a path -- traceable, but do not pass
 +    `--require-audio` for those.
++
++    `extra_fields` names further columns to carry in `_extra` -- per-clip
++    quality scores (DNSMOS and friends) that the caller wants to gate on or
++    record in the manifest. They are fetched per batch like everything else, so
++    naming them costs a column read, not a decode of the audio.
 +    """
 +    pa = _pyarrow()
 +    files = arrow_fragments(path, split=split)
@@ -249,6 +257,15 @@ diff -urN orig/persian_tts_frontend/cli.py new/persian_tts_frontend/cli.py
 +                                 "speaker-hours will be empty")
 +            durs = dur_col.to_pylist() if dur_col is not None else [None] * n
 +
++            extras = {}
++            for name in extra_fields:
++                col = _column(pa, batch, name)
++                if col is None:
++                    warn("extra:" + name, f"no {name!r} column -- "
++                                          "ignored by --keep-fields/--min-field")
++                    continue
++                extras[name] = col.to_pylist()
++
 +            for k in range(n):
 +                audio = auds[k] or ""
 +                if audio and audio_root and not os.path.isabs(audio):
@@ -263,7 +280,7 @@ diff -urN orig/persian_tts_frontend/cli.py new/persian_tts_frontend/cli.py
 +                            ("" if text is None else str(text)),
 +                    "duration": _as_float(durs[k]),
 +                    "speaker": None if spk is None else str(spk),
-+                    "_extra": {},
++                    "_extra": {name: v[k] for name, v in extras.items()},
 +                }
 +            row_no += n
 +
@@ -283,8 +300,16 @@ diff -urN orig/persian_tts_frontend/cli.py new/persian_tts_frontend/cli.py
  
  # ------------------------------------------------------------------ main pass
  
-@@ -148,10 +401,12 @@
+@@ -146,12 +414,20 @@
+     nz = Normalizer(config=cfg)
+     print(f"frontend version: {nz.version}", file=sys.stderr)
  
++    bounds = _parse_bounds(args.min_field, args.max_field)
++    keep_fields = [f for f in (args.keep_fields or "").split(",") if f]
++    # A gate on a column implies reading it, whether or not it is also kept.
++    wanted = list(dict.fromkeys(keep_fields + list(bounds)))
++    drop_re = re.compile(args.drop_text_matching) if args.drop_text_matching else None
++
      adapter = ADAPTERS[args.adapter]
      kwargs = dict(audio_root=args.audio_root)
 -    if args.adapter in ("jsonl", "csv", "tsv"):
@@ -293,11 +318,84 @@ diff -urN orig/persian_tts_frontend/cli.py new/persian_tts_frontend/cli.py
                        speaker_field=args.speaker_field,
                        duration_field=args.duration_field)
 +    if args.adapter in ("arrow", "parquet"):
-+        kwargs.update(split=args.split)
++        kwargs.update(split=args.split, extra_fields=wanted)
      rows = adapter(args.input, **kwargs)
  
      stats = Counter()
-@@ -287,6 +542,65 @@
+@@ -162,6 +438,9 @@
+     densities = []
+     samples_for_selftest = []
+     dropped_examples = []
++    # Distribution of every gated/kept numeric column, over the rows that
++    # survived -- this is what you read to choose the next threshold.
++    field_values = defaultdict(list)
+ 
+     out = open(args.output, "w", encoding="utf-8") if args.output else None
+     try:
+@@ -178,6 +457,29 @@
+                 stats["drop_empty_source"] += 1
+                 continue
+ 
++            # Source-level gates, before the normalizer does any work: a row
++            # rejected on DNSMOS or on a junk pattern should not cost a pass.
++            if drop_re is not None and drop_re.search(raw):
++                stats["drop_text_pattern"] += 1
++                if len(dropped_examples) < 10:
++                    dropped_examples.append({"reason": "text_pattern",
++                                             "raw": raw[:120]})
++                continue
++            extra = r.get("_extra") or {}
++            gated = False
++            for name, (lo, hi) in bounds.items():
++                v = _as_number(extra.get(name))
++                if v is None:
++                    stats[f"drop_{name}_missing"] += 1
++                    gated = True
++                    break
++                if (lo is not None and v < lo) or (hi is not None and v > hi):
++                    stats[f"drop_{name}_out_of_range"] += 1
++                    gated = True
++                    break
++            if gated:
++                continue
++
+             res = nz.normalize(raw)
+ 
+             if len(samples_for_selftest) < 2000:
+@@ -212,6 +514,10 @@
+ 
+             stats["kept"] += 1
+             densities.append(res.diacritic_density)
++            for name in wanted:
++                v = _as_number(extra.get(name))
++                if v is not None:
++                    field_values[name].append(v)
+             spk = r.get("speaker") or args.default_speaker
+             if spk:
+                 speakers[spk] += 1
+@@ -230,6 +536,10 @@
+                     row["diacritic_density"] = round(res.diacritic_density, 4)
+                     if spk:
+                         row["speaker"] = spk
++                for name in keep_fields:
++                    if name in extra and extra[name] is not None:
++                        v = extra[name]
++                        row[name] = round(v, 4) if isinstance(v, float) else v
+                 out.write(json.dumps(row, ensure_ascii=False) + "\n")
+     finally:
+         if out:
+@@ -264,6 +574,10 @@
+         "dropped_examples": dropped_examples,
+     }
+ 
++    if field_values:
++        rep["field_stats"] = {name: _quantiles(v)
++                              for name, v in sorted(field_values.items())}
++
+     if args.selftest:
+         rep["selftest_failures"] = {
+             k: (len(v), v[:5]) for k, v in
+@@ -287,6 +601,112 @@
      return 0
  
  
@@ -360,10 +458,57 @@ diff -urN orig/persian_tts_frontend/cli.py new/persian_tts_frontend/cli.py
 +    return v if isinstance(v, (str, int, float, bool, type(None))) else str(v)
 +
 +
++def _as_number(v):
++    if isinstance(v, bool) or v is None:
++        return None
++    if isinstance(v, (int, float)):
++        return float(v)
++    try:
++        return float(v)
++    except (TypeError, ValueError):
++        return None
++
++
++def _parse_bounds(min_specs, max_specs):
++    """`["mos_ovr=3.5"]`, `["wer=0.2"]` -> `{"mos_ovr": (3.5, None), ...}`."""
++    bounds = {}
++    for specs, idx in ((min_specs or [], 0), (max_specs or [], 1)):
++        for spec in specs:
++            name, sep, raw = spec.partition("=")
++            name = name.strip()
++            if not sep or not name:
++                raise SystemExit(
++                    f"bad field bound {spec!r} -- expected NAME=VALUE, "
++                    "e.g. --min-field mos_ovr=3.5")
++            v = _as_number(raw.strip())
++            if v is None:
++                raise SystemExit(f"bad field bound {spec!r} -- "
++                                 f"{raw.strip()!r} is not a number")
++            lo, hi = bounds.get(name, (None, None))
++            bounds[name] = (v, hi) if idx == 0 else (lo, v)
++    return bounds
++
++
++def _quantiles(values):
++    """Distribution summary for a gated column. Reported over kept rows, so
++    after a gate it shows what you kept -- rerun without the gate to see the
++    whole corpus and pick the next threshold."""
++    v = sorted(values)
++    n = len(v)
++
++    def q(p):
++        return round(v[min(n - 1, int(p * n))], 4)
++
++    return {"n": n, "min": round(v[0], 4), "p10": q(0.10), "p25": q(0.25),
++            "median": q(0.50), "p75": q(0.75), "p90": q(0.90),
++            "max": round(v[-1], 4),
++            "mean": round(sum(v) / n, 4)}
++
++
  def _skew(counts):
      """Crude concentration measure: share of rows held by the top 10% of
      speakers. Above ~0.5 means you need the per-narrator cap."""
-@@ -304,8 +618,11 @@
+@@ -304,8 +724,11 @@
      sub = p.add_subparsers(dest="cmd", required=True)
  
      n = sub.add_parser("normalize", help="normalize a corpus into a manifest")
@@ -376,7 +521,22 @@ diff -urN orig/persian_tts_frontend/cli.py new/persian_tts_frontend/cli.py
      n.add_argument("--output", default=None)
      n.add_argument("--report", default=None)
      n.add_argument("--audio-root", default=None)
-@@ -332,6 +649,14 @@
+@@ -328,10 +751,29 @@
+                    choices=["momayez", "fractional"])
+     n.add_argument("--latin-strategy", default="escalate",
+                    choices=["escalate", "lexicon", "transliterate"])
++    n.add_argument("--keep-fields", default=None, metavar="A,B",
++                   help="extra source columns to copy into the manifest rows, "
++                        "e.g. mos_ovr,mos_p808")
++    n.add_argument("--min-field", action="append", default=[], metavar="NAME=V",
++                   help="drop rows whose NAME is below V (repeatable), "
++                        "e.g. --min-field mos_ovr=3.5")
++    n.add_argument("--max-field", action="append", default=[], metavar="NAME=V",
++                   help="drop rows whose NAME is above V (repeatable)")
++    n.add_argument("--drop-text-matching", default=None, metavar="REGEX",
++                   help="drop rows whose raw text matches, e.g. subtitle "
++                        r"leftovers: '-->|\d{2}:\d{2}:\d{2}[,.]\d{3}'")
+     n.add_argument("--no-provenance", action="store_true")
      n.add_argument("--selftest", action="store_true")
      n.set_defaults(func=run_normalize)
  
@@ -393,7 +553,7 @@ diff -urN orig/persian_tts_frontend/cli.py new/persian_tts_frontend/cli.py
  
 diff -urN orig/persian_tts_frontend/expand.py new/persian_tts_frontend/expand.py
 --- a/persian_tts_frontend/expand.py	2026-07-31 16:14:05.000000000 +0100
-+++ b/persian_tts_frontend/expand.py	2026-08-01 09:08:52.179223810 +0100
++++ b/persian_tts_frontend/expand.py	2026-08-01 10:27:25.288131810 +0100
 @@ -9,7 +9,8 @@
  import re
  
@@ -479,7 +639,7 @@ diff -urN orig/persian_tts_frontend/expand.py new/persian_tts_frontend/expand.py
          "phone": expand_phone,
 diff -urN orig/persian_tts_frontend/normalize.py new/persian_tts_frontend/normalize.py
 --- a/persian_tts_frontend/normalize.py	2026-07-31 16:14:05.000000000 +0100
-+++ b/persian_tts_frontend/normalize.py	2026-08-01 09:08:52.179223810 +0100
++++ b/persian_tts_frontend/normalize.py	2026-08-01 10:27:25.288131810 +0100
 @@ -145,6 +145,15 @@
      `ها`/`تر`/`ترین` suffixes.
      """
@@ -511,7 +671,7 @@ diff -urN orig/persian_tts_frontend/normalize.py new/persian_tts_frontend/normal
  
 diff -urN orig/persian_tts_frontend/numbers.py new/persian_tts_frontend/numbers.py
 --- a/persian_tts_frontend/numbers.py	2026-07-31 16:14:05.000000000 +0100
-+++ b/persian_tts_frontend/numbers.py	2026-08-01 09:08:52.179223810 +0100
++++ b/persian_tts_frontend/numbers.py	2026-08-01 10:27:25.288131810 +0100
 @@ -10,6 +10,7 @@
  
  ZERO = "صفر"
@@ -522,7 +682,7 @@ diff -urN orig/persian_tts_frontend/numbers.py new/persian_tts_frontend/numbers.
  ONES = ["", "یک", "دو", "سه", "چهار", "پنج", "شش", "هفت", "هشت", "نه"]
 diff -urN orig/persian_tts_frontend/pipeline.py new/persian_tts_frontend/pipeline.py
 --- a/persian_tts_frontend/pipeline.py	2026-07-31 16:14:05.000000000 +0100
-+++ b/persian_tts_frontend/pipeline.py	2026-08-01 09:08:52.179223810 +0100
++++ b/persian_tts_frontend/pipeline.py	2026-08-01 10:27:25.288131810 +0100
 @@ -138,6 +138,11 @@
          unexpected = tuple(sorted(set(self._allowed_re.findall(text))))
          if unexpected and self.cfg.strip_unknown_chars:
@@ -537,7 +697,7 @@ diff -urN orig/persian_tts_frontend/pipeline.py new/persian_tts_frontend/pipelin
          # 10. escapes back
 diff -urN orig/pyproject.toml new/pyproject.toml
 --- a/pyproject.toml	2026-07-31 16:14:06.000000000 +0100
-+++ b/pyproject.toml	2026-08-01 09:08:52.179223810 +0100
++++ b/pyproject.toml	2026-08-01 10:27:25.288131810 +0100
 @@ -7,10 +7,11 @@
  version = "1.0.0"
  description = "Persian text normalization frontend for VoxCPM 2 fine-tuning"
@@ -554,8 +714,8 @@ diff -urN orig/pyproject.toml new/pyproject.toml
  packages = ["persian_tts_frontend"]
 diff -urN orig/README.md new/README.md
 --- a/README.md	2026-07-31 16:14:06.000000000 +0100
-+++ b/README.md	2026-08-01 09:08:52.179223810 +0100
-@@ -63,9 +63,41 @@
++++ b/README.md	2026-08-01 10:27:25.288131810 +0100
+@@ -63,9 +63,66 @@
      --output /data/manifests/cv.jsonl --dataset-id 3 --tier diversity
  ```
  
@@ -591,6 +751,31 @@ diff -urN orig/README.md new/README.md
 +Python**, so the audio payload is never faulted in: a 300 MB dataset normalizes
 +at ~75 MB RSS. Dotted names reach into structs (`--audio-field audio.path`).
 +
++### Gating on per-clip quality columns
++
++Datasets that ship DNSMOS (or any other numeric per-clip score) can be filtered
++and have the score carried into the manifest:
++
++```bash
++python -m persian_tts_frontend.cli normalize \
++    --input /data/thom_arrow --adapter arrow --text-field sentence \
++    --keep-fields mos_ovr,mos_p808 \
++    --min-field mos_ovr=3.5 --min-field mos_p808=3.4 \
++    --drop-text-matching '\-\->|\d{2}:\d{2}:\d{2}[,.]\d{3}' \
++    --output /data/manifests/thom.jsonl --report /data/manifests/thom.json
++```
++
++`--min-field`/`--max-field` are repeatable and take `NAME=VALUE`; naming a
++column in either implies reading it. Rows missing the column are dropped and
++counted separately (`drop_<name>_missing`) rather than silently kept.
++`--drop-text-matching` takes a regex against the **raw** text — use it for
++subtitle timecodes, boilerplate, and other source junk that normalization
++cannot repair.
++
++Run once with `--keep-fields` and no gate first: the report grows a
++`field_stats` block (min/p10/p25/median/p75/p90/max) over the kept rows, which
++is what you read to choose the threshold.
++
 +An `audio` column of `struct<bytes, path>` with a null `path` — i.e. audio
 +embedded in the Arrow file, with no file on disk — yields a
 +`<file>#row=N` locator in the manifest instead of a path. Those rows are
@@ -600,7 +785,7 @@ diff -urN orig/README.md new/README.md
  
  ### Read these four numbers in the report before proceeding
  
-@@ -225,7 +257,7 @@
+@@ -225,7 +282,7 @@
    diacritics.py   strip/mask/validate, MaskingSchedule, STAGE_B_DENSITY_MIX
    pipeline.py     Normalizer, config, version hash, selftest
    audit.py        roundtrip, fertility, cost curve, clip survival
@@ -611,7 +796,7 @@ diff -urN orig/README.md new/README.md
  scripts/run_audit.py
 diff -urN orig/tests/test_frontend.py new/tests/test_frontend.py
 --- a/tests/test_frontend.py	2026-07-31 16:14:05.000000000 +0100
-+++ b/tests/test_frontend.py	2026-08-01 09:08:52.179223810 +0100
++++ b/tests/test_frontend.py	2026-08-01 10:27:25.288131810 +0100
 @@ -112,6 +112,78 @@
            "no ASCII digits survive expansion")
  
@@ -691,7 +876,7 @@ diff -urN orig/tests/test_frontend.py new/tests/test_frontend.py
  def test_punctuation():
      nz = Normalizer()
      check("\u060c" in nz("سلام, خوبی"), "ASCII comma -> Persian comma")
-@@ -248,6 +320,75 @@
+@@ -248,6 +320,133 @@
            "transliterate leaves no Latin", nz3("برند Sharp"), "no ascii")
  
  
@@ -762,6 +947,64 @@ diff -urN orig/tests/test_frontend.py new/tests/test_frontend.py
 +            check("nope" in str(e) and "narrator" in str(e),
 +                  "arrow: unknown --text-field lists the real columns", str(e),
 +                  "message naming the available columns")
++
++
++def test_field_bounds_and_quantiles():
++    from persian_tts_frontend.cli import _parse_bounds, _quantiles, _as_number
++
++    eq(_parse_bounds(["mos_ovr=3.5"], []), {"mos_ovr": (3.5, None)}, "min only")
++    eq(_parse_bounds([], ["wer=0.2"]), {"wer": (None, 0.2)}, "max only")
++    eq(_parse_bounds(["a=1"], ["a=9"]), {"a": (1.0, 9.0)}, "both ends of one field")
++    for bad in ["mos_ovr", "mos_ovr=high", "=3"]:
++        try:
++            _parse_bounds([bad], [])
++            check(False, f"bad bound rejected: {bad}")
++        except SystemExit:
++            pass
++    # a numeric string is a number; a bool is not a score
++    eq(_as_number("3.5"), 3.5, "numeric string")
++    eq(_as_number(True), None, "bool is not a score")
++    eq(_as_number(None), None, "null is not a score")
++
++    q = _quantiles([1.0, 2.0, 3.0, 4.0, 5.0])
++    eq(q["n"], 5, "quantile count")
++    eq(q["min"], 1.0, "quantile min")
++    eq(q["max"], 5.0, "quantile max")
++    eq(q["median"], 3.0, "quantile median")
++    eq(_quantiles([2.0])["median"], 2.0, "single value does not index past end")
++
++
++def test_arrow_gating():
++    """The thomclas shape: text + embedded audio + per-clip DNSMOS columns."""
++    try:
++        import pyarrow as pa
++    except ImportError:
++        return
++    import tempfile
++    from persian_tts_frontend.cli import adapter_arrow
++
++    with tempfile.TemporaryDirectory() as d:
++        tbl = pa.table({
++            "sentence": pa.array(["جمله اول است", "جمله دوم است"]),
++            "audio": pa.array([{"bytes": b"RIFF", "path": None}] * 2,
++                              type=pa.struct([("bytes", pa.binary()),
++                                              ("path", pa.string())])),
++            "mos_ovr": pa.array([4.25, 1.75], type=pa.float64()),
++        })
++        with pa.OSFile(str(Path(d) / "data-00000-of-00001.arrow"), "wb") as sink:
++            w = pa.ipc.new_stream(sink, tbl.schema)
++            w.write_table(tbl)
++            w.close()
++
++        rows = list(adapter_arrow(d, text_field="sentence",
++                                  extra_fields=["mos_ovr"]))
++        eq(len(rows), 2, "gated adapter: row count")
++        eq(rows[0]["_extra"]["mos_ovr"], 4.25, "extra column reaches _extra")
++        eq(rows[1]["_extra"]["mos_ovr"], 1.75, "extra column per row")
++        # a column that is not there must not crash the pass
++        rows2 = list(adapter_arrow(d, text_field="sentence",
++                                   extra_fields=["nope"]))
++        eq(rows2[0]["_extra"], {}, "absent extra column yields no key")
 +
 +
  # ------------------------------------------------------------------ runner

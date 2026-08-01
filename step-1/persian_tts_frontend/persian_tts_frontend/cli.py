@@ -42,6 +42,7 @@ import csv
 import glob
 import json
 import os
+import re
 import sys
 from collections import Counter, defaultdict
 
@@ -291,7 +292,7 @@ def _as_float(v):
 
 def adapter_arrow(path, audio_root=None, text_field="text",
                   audio_field="audio", speaker_field=None,
-                  duration_field="duration", split=None):
+                  duration_field="duration", split=None, extra_fields=()):
     """Arrow / HuggingFace `datasets` dataset.
 
     Only the columns named by the field flags are converted to Python, so a
@@ -299,6 +300,11 @@ def adapter_arrow(path, audio_root=None, text_field="text",
     column. Rows whose audio is embedded (struct<bytes, path> with no path) get
     a `<file>#row=N` locator instead of a path -- traceable, but do not pass
     `--require-audio` for those.
+
+    `extra_fields` names further columns to carry in `_extra` -- per-clip
+    quality scores (DNSMOS and friends) that the caller wants to gate on or
+    record in the manifest. They are fetched per batch like everything else, so
+    naming them costs a column read, not a decode of the audio.
     """
     pa = _pyarrow()
     files = arrow_fragments(path, split=split)
@@ -355,6 +361,15 @@ def adapter_arrow(path, audio_root=None, text_field="text",
                                  "speaker-hours will be empty")
             durs = dur_col.to_pylist() if dur_col is not None else [None] * n
 
+            extras = {}
+            for name in extra_fields:
+                col = _column(pa, batch, name)
+                if col is None:
+                    warn("extra:" + name, f"no {name!r} column -- "
+                                          "ignored by --keep-fields/--min-field")
+                    continue
+                extras[name] = col.to_pylist()
+
             for k in range(n):
                 audio = auds[k] or ""
                 if audio and audio_root and not os.path.isabs(audio):
@@ -369,7 +384,7 @@ def adapter_arrow(path, audio_root=None, text_field="text",
                             ("" if text is None else str(text)),
                     "duration": _as_float(durs[k]),
                     "speaker": None if spk is None else str(spk),
-                    "_extra": {},
+                    "_extra": {name: v[k] for name, v in extras.items()},
                 }
             row_no += n
 
@@ -399,6 +414,12 @@ def run_normalize(args):
     nz = Normalizer(config=cfg)
     print(f"frontend version: {nz.version}", file=sys.stderr)
 
+    bounds = _parse_bounds(args.min_field, args.max_field)
+    keep_fields = [f for f in (args.keep_fields or "").split(",") if f]
+    # A gate on a column implies reading it, whether or not it is also kept.
+    wanted = list(dict.fromkeys(keep_fields + list(bounds)))
+    drop_re = re.compile(args.drop_text_matching) if args.drop_text_matching else None
+
     adapter = ADAPTERS[args.adapter]
     kwargs = dict(audio_root=args.audio_root)
     if args.adapter in FIELD_AWARE:
@@ -406,7 +427,7 @@ def run_normalize(args):
                       speaker_field=args.speaker_field,
                       duration_field=args.duration_field)
     if args.adapter in ("arrow", "parquet"):
-        kwargs.update(split=args.split)
+        kwargs.update(split=args.split, extra_fields=wanted)
     rows = adapter(args.input, **kwargs)
 
     stats = Counter()
@@ -417,6 +438,9 @@ def run_normalize(args):
     densities = []
     samples_for_selftest = []
     dropped_examples = []
+    # Distribution of every gated/kept numeric column, over the rows that
+    # survived -- this is what you read to choose the next threshold.
+    field_values = defaultdict(list)
 
     out = open(args.output, "w", encoding="utf-8") if args.output else None
     try:
@@ -431,6 +455,29 @@ def run_normalize(args):
             raw = (r.get("text") or "").strip()
             if not raw:
                 stats["drop_empty_source"] += 1
+                continue
+
+            # Source-level gates, before the normalizer does any work: a row
+            # rejected on DNSMOS or on a junk pattern should not cost a pass.
+            if drop_re is not None and drop_re.search(raw):
+                stats["drop_text_pattern"] += 1
+                if len(dropped_examples) < 10:
+                    dropped_examples.append({"reason": "text_pattern",
+                                             "raw": raw[:120]})
+                continue
+            extra = r.get("_extra") or {}
+            gated = False
+            for name, (lo, hi) in bounds.items():
+                v = _as_number(extra.get(name))
+                if v is None:
+                    stats[f"drop_{name}_missing"] += 1
+                    gated = True
+                    break
+                if (lo is not None and v < lo) or (hi is not None and v > hi):
+                    stats[f"drop_{name}_out_of_range"] += 1
+                    gated = True
+                    break
+            if gated:
                 continue
 
             res = nz.normalize(raw)
@@ -467,6 +514,10 @@ def run_normalize(args):
 
             stats["kept"] += 1
             densities.append(res.diacritic_density)
+            for name in wanted:
+                v = _as_number(extra.get(name))
+                if v is not None:
+                    field_values[name].append(v)
             spk = r.get("speaker") or args.default_speaker
             if spk:
                 speakers[spk] += 1
@@ -485,6 +536,10 @@ def run_normalize(args):
                     row["diacritic_density"] = round(res.diacritic_density, 4)
                     if spk:
                         row["speaker"] = spk
+                for name in keep_fields:
+                    if name in extra and extra[name] is not None:
+                        v = extra[name]
+                        row[name] = round(v, 4) if isinstance(v, float) else v
                 out.write(json.dumps(row, ensure_ascii=False) + "\n")
     finally:
         if out:
@@ -518,6 +573,10 @@ def run_normalize(args):
         "latin_work_queue": nz.latin.work_queue(60),
         "dropped_examples": dropped_examples,
     }
+
+    if field_values:
+        rep["field_stats"] = {name: _quantiles(v)
+                              for name, v in sorted(field_values.items())}
 
     if args.selftest:
         rep["selftest_failures"] = {
@@ -601,6 +660,53 @@ def _cell(pa, arr, i):
     return v if isinstance(v, (str, int, float, bool, type(None))) else str(v)
 
 
+def _as_number(v):
+    if isinstance(v, bool) or v is None:
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_bounds(min_specs, max_specs):
+    """`["mos_ovr=3.5"]`, `["wer=0.2"]` -> `{"mos_ovr": (3.5, None), ...}`."""
+    bounds = {}
+    for specs, idx in ((min_specs or [], 0), (max_specs or [], 1)):
+        for spec in specs:
+            name, sep, raw = spec.partition("=")
+            name = name.strip()
+            if not sep or not name:
+                raise SystemExit(
+                    f"bad field bound {spec!r} -- expected NAME=VALUE, "
+                    "e.g. --min-field mos_ovr=3.5")
+            v = _as_number(raw.strip())
+            if v is None:
+                raise SystemExit(f"bad field bound {spec!r} -- "
+                                 f"{raw.strip()!r} is not a number")
+            lo, hi = bounds.get(name, (None, None))
+            bounds[name] = (v, hi) if idx == 0 else (lo, v)
+    return bounds
+
+
+def _quantiles(values):
+    """Distribution summary for a gated column. Reported over kept rows, so
+    after a gate it shows what you kept -- rerun without the gate to see the
+    whole corpus and pick the next threshold."""
+    v = sorted(values)
+    n = len(v)
+
+    def q(p):
+        return round(v[min(n - 1, int(p * n))], 4)
+
+    return {"n": n, "min": round(v[0], 4), "p10": q(0.10), "p25": q(0.25),
+            "median": q(0.50), "p75": q(0.75), "p90": q(0.90),
+            "max": round(v[-1], 4),
+            "mean": round(sum(v) / n, 4)}
+
+
 def _skew(counts):
     """Crude concentration measure: share of rows held by the top 10% of
     speakers. Above ~0.5 means you need the per-narrator cap."""
@@ -645,6 +751,17 @@ def main(argv=None):
                    choices=["momayez", "fractional"])
     n.add_argument("--latin-strategy", default="escalate",
                    choices=["escalate", "lexicon", "transliterate"])
+    n.add_argument("--keep-fields", default=None, metavar="A,B",
+                   help="extra source columns to copy into the manifest rows, "
+                        "e.g. mos_ovr,mos_p808")
+    n.add_argument("--min-field", action="append", default=[], metavar="NAME=V",
+                   help="drop rows whose NAME is below V (repeatable), "
+                        "e.g. --min-field mos_ovr=3.5")
+    n.add_argument("--max-field", action="append", default=[], metavar="NAME=V",
+                   help="drop rows whose NAME is above V (repeatable)")
+    n.add_argument("--drop-text-matching", default=None, metavar="REGEX",
+                   help="drop rows whose raw text matches, e.g. subtitle "
+                        r"leftovers: '-->|\d{2}:\d{2}:\d{2}[,.]\d{3}'")
     n.add_argument("--no-provenance", action="store_true")
     n.add_argument("--selftest", action="store_true")
     n.set_defaults(func=run_normalize)
