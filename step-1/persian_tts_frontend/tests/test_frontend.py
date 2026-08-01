@@ -305,6 +305,25 @@ def test_version_stability():
     check(c.version != a.version, "config change alters version",
           c.version, f"!= {a.version}")
     check(a.version.startswith("fa-fe-"), "version prefix", a.version, "fa-fe-*")
+    # pipeline.py holds the rule order and the charset-guard policy, so it has
+    # to be inside the hash or two frontends that disagree on the output text
+    # can advertise the same version.
+    import inspect as _i
+    from persian_tts_frontend import pipeline as _p
+    src = _i.getsource(_p)
+    check("sys.modules[__name__]" in src, "version hash covers pipeline.py")
+
+
+def test_unknown_chars_do_not_weld_words():
+    """The charset guard replaces with a space, not "" -- deleting outright
+    turned "۲×۳" into the fabricated word "دوسه"."""
+    nz = Normalizer()
+    eq(nz("و/یا این"), "و یا این", "slash does not weld")
+    check(" " in nz("۲×۳ برابر شش"), "multiplication sign does not weld",
+          nz("۲×۳ برابر شش"), "دو سه ...")
+    # a stripped char already beside whitespace must not add a second space
+    eq(nz("آهنگ ♫ پخش شد"), "آهنگ پخش شد", "no doubled space")
+    eq(nz("کتاب دنیل بل* را"), "کتاب دنیل بل را", "trailing marker")
 
 
 def test_latin_resolution():

@@ -11,6 +11,7 @@ import hashlib
 import inspect
 import json
 import re
+import sys
 from dataclasses import dataclass, field, asdict
 
 from . import chars, diacritics, expand, latin, normalize, numbers
@@ -76,10 +77,16 @@ class Normalizer:
         Any edit to any rule module changes this string. Write it into the
         manifest; refuse to serve a model whose recorded version does not match
         the deployed frontend.
+
+        This module is hashed too. It holds the order the rules run in and the
+        charset-guard policy, both of which change the output text -- leaving it
+        out let two frontends that disagree on the text advertise the same
+        version, which is precisely the skew the hash exists to prevent.
         """
         if self._version is None:
             h = hashlib.sha256()
-            for mod in (chars, normalize, numbers, expand, latin, diacritics):
+            for mod in (chars, normalize, numbers, expand, latin, diacritics,
+                        sys.modules[__name__]):
                 h.update(inspect.getsource(mod).encode("utf-8"))
             h.update(json.dumps(
                 {k: sorted(v) if isinstance(v, frozenset) else v
@@ -137,7 +144,11 @@ class Normalizer:
         # 9. charset guard
         unexpected = tuple(sorted(set(self._allowed_re.findall(text))))
         if unexpected and self.cfg.strip_unknown_chars:
-            text = self._allowed_re.sub("", text)
+            # A space, not "". Deleting outright welds the neighbours into one
+            # fabricated word -- "۲×۳" became "دوسه" and "و/یا" became "ویا".
+            # A space leaves two real words; fix_spacing collapses the rest, so
+            # a stripped char that already sat next to whitespace is unaffected.
+            text = self._allowed_re.sub(" ", text)
             # Stripping can expose punctuation artifacts that step 7 already
             # walked past -- deleting the ">" of an SRT "-->" leaves a dangling
             # dash that only a second cleanup turns into a single pause. Redo it

@@ -1,6 +1,6 @@
 diff -urN orig/persian_tts_frontend/cli.py new/persian_tts_frontend/cli.py
 --- a/persian_tts_frontend/cli.py	2026-07-31 16:14:05.000000000 +0100
-+++ b/persian_tts_frontend/cli.py	2026-08-01 10:27:25.288131810 +0100
++++ b/persian_tts_frontend/cli.py	2026-08-01 10:42:00.718529292 +0100
 @@ -15,6 +15,15 @@
          --output /data/fidibo/manifest.jsonl --dataset-id 1 \
          --tier core --speaker-field narrator
@@ -553,7 +553,7 @@ diff -urN orig/persian_tts_frontend/cli.py new/persian_tts_frontend/cli.py
  
 diff -urN orig/persian_tts_frontend/expand.py new/persian_tts_frontend/expand.py
 --- a/persian_tts_frontend/expand.py	2026-07-31 16:14:05.000000000 +0100
-+++ b/persian_tts_frontend/expand.py	2026-08-01 10:27:25.288131810 +0100
++++ b/persian_tts_frontend/expand.py	2026-08-01 10:42:00.718529292 +0100
 @@ -9,7 +9,8 @@
  import re
  
@@ -639,7 +639,7 @@ diff -urN orig/persian_tts_frontend/expand.py new/persian_tts_frontend/expand.py
          "phone": expand_phone,
 diff -urN orig/persian_tts_frontend/normalize.py new/persian_tts_frontend/normalize.py
 --- a/persian_tts_frontend/normalize.py	2026-07-31 16:14:05.000000000 +0100
-+++ b/persian_tts_frontend/normalize.py	2026-08-01 10:27:25.288131810 +0100
++++ b/persian_tts_frontend/normalize.py	2026-08-01 10:42:00.718529292 +0100
 @@ -145,6 +145,15 @@
      `ها`/`تر`/`ترین` suffixes.
      """
@@ -671,7 +671,7 @@ diff -urN orig/persian_tts_frontend/normalize.py new/persian_tts_frontend/normal
  
 diff -urN orig/persian_tts_frontend/numbers.py new/persian_tts_frontend/numbers.py
 --- a/persian_tts_frontend/numbers.py	2026-07-31 16:14:05.000000000 +0100
-+++ b/persian_tts_frontend/numbers.py	2026-08-01 10:27:25.288131810 +0100
++++ b/persian_tts_frontend/numbers.py	2026-08-01 10:42:00.718529292 +0100
 @@ -10,6 +10,7 @@
  
  ZERO = "صفر"
@@ -682,11 +682,43 @@ diff -urN orig/persian_tts_frontend/numbers.py new/persian_tts_frontend/numbers.
  ONES = ["", "یک", "دو", "سه", "چهار", "پنج", "شش", "هفت", "هشت", "نه"]
 diff -urN orig/persian_tts_frontend/pipeline.py new/persian_tts_frontend/pipeline.py
 --- a/persian_tts_frontend/pipeline.py	2026-07-31 16:14:05.000000000 +0100
-+++ b/persian_tts_frontend/pipeline.py	2026-08-01 10:27:25.288131810 +0100
-@@ -138,6 +138,11 @@
++++ b/persian_tts_frontend/pipeline.py	2026-08-01 10:42:00.718529292 +0100
+@@ -11,6 +11,7 @@
+ import inspect
+ import json
+ import re
++import sys
+ from dataclasses import dataclass, field, asdict
+ 
+ from . import chars, diacritics, expand, latin, normalize, numbers
+@@ -76,10 +77,16 @@
+         Any edit to any rule module changes this string. Write it into the
+         manifest; refuse to serve a model whose recorded version does not match
+         the deployed frontend.
++
++        This module is hashed too. It holds the order the rules run in and the
++        charset-guard policy, both of which change the output text -- leaving it
++        out let two frontends that disagree on the text advertise the same
++        version, which is precisely the skew the hash exists to prevent.
+         """
+         if self._version is None:
+             h = hashlib.sha256()
+-            for mod in (chars, normalize, numbers, expand, latin, diacritics):
++            for mod in (chars, normalize, numbers, expand, latin, diacritics,
++                        sys.modules[__name__]):
+                 h.update(inspect.getsource(mod).encode("utf-8"))
+             h.update(json.dumps(
+                 {k: sorted(v) if isinstance(v, frozenset) else v
+@@ -137,7 +144,16 @@
+         # 9. charset guard
          unexpected = tuple(sorted(set(self._allowed_re.findall(text))))
          if unexpected and self.cfg.strip_unknown_chars:
-             text = self._allowed_re.sub("", text)
+-            text = self._allowed_re.sub("", text)
++            # A space, not "". Deleting outright welds the neighbours into one
++            # fabricated word -- "۲×۳" became "دوسه" and "و/یا" became "ویا".
++            # A space leaves two real words; fix_spacing collapses the rest, so
++            # a stripped char that already sat next to whitespace is unaffected.
++            text = self._allowed_re.sub(" ", text)
 +            # Stripping can expose punctuation artifacts that step 7 already
 +            # walked past -- deleting the ">" of an SRT "-->" leaves a dangling
 +            # dash that only a second cleanup turns into a single pause. Redo it
@@ -697,7 +729,7 @@ diff -urN orig/persian_tts_frontend/pipeline.py new/persian_tts_frontend/pipelin
          # 10. escapes back
 diff -urN orig/pyproject.toml new/pyproject.toml
 --- a/pyproject.toml	2026-07-31 16:14:06.000000000 +0100
-+++ b/pyproject.toml	2026-08-01 10:27:25.288131810 +0100
++++ b/pyproject.toml	2026-08-01 10:42:00.718529292 +0100
 @@ -7,10 +7,11 @@
  version = "1.0.0"
  description = "Persian text normalization frontend for VoxCPM 2 fine-tuning"
@@ -714,7 +746,7 @@ diff -urN orig/pyproject.toml new/pyproject.toml
  packages = ["persian_tts_frontend"]
 diff -urN orig/README.md new/README.md
 --- a/README.md	2026-07-31 16:14:06.000000000 +0100
-+++ b/README.md	2026-08-01 10:27:25.288131810 +0100
++++ b/README.md	2026-08-01 10:42:00.718529292 +0100
 @@ -63,9 +63,66 @@
      --output /data/manifests/cv.jsonl --dataset-id 3 --tier diversity
  ```
@@ -796,7 +828,7 @@ diff -urN orig/README.md new/README.md
  scripts/run_audit.py
 diff -urN orig/tests/test_frontend.py new/tests/test_frontend.py
 --- a/tests/test_frontend.py	2026-07-31 16:14:05.000000000 +0100
-+++ b/tests/test_frontend.py	2026-08-01 10:27:25.288131810 +0100
++++ b/tests/test_frontend.py	2026-08-01 10:42:00.718529292 +0100
 @@ -112,6 +112,78 @@
            "no ASCII digits survive expansion")
  
@@ -876,7 +908,33 @@ diff -urN orig/tests/test_frontend.py new/tests/test_frontend.py
  def test_punctuation():
      nz = Normalizer()
      check("\u060c" in nz("سلام, خوبی"), "ASCII comma -> Persian comma")
-@@ -248,6 +320,133 @@
+@@ -233,6 +305,25 @@
+     check(c.version != a.version, "config change alters version",
+           c.version, f"!= {a.version}")
+     check(a.version.startswith("fa-fe-"), "version prefix", a.version, "fa-fe-*")
++    # pipeline.py holds the rule order and the charset-guard policy, so it has
++    # to be inside the hash or two frontends that disagree on the output text
++    # can advertise the same version.
++    import inspect as _i
++    from persian_tts_frontend import pipeline as _p
++    src = _i.getsource(_p)
++    check("sys.modules[__name__]" in src, "version hash covers pipeline.py")
++
++
++def test_unknown_chars_do_not_weld_words():
++    """The charset guard replaces with a space, not "" -- deleting outright
++    turned "۲×۳" into the fabricated word "دوسه"."""
++    nz = Normalizer()
++    eq(nz("و/یا این"), "و یا این", "slash does not weld")
++    check(" " in nz("۲×۳ برابر شش"), "multiplication sign does not weld",
++          nz("۲×۳ برابر شش"), "دو سه ...")
++    # a stripped char already beside whitespace must not add a second space
++    eq(nz("آهنگ ♫ پخش شد"), "آهنگ پخش شد", "no doubled space")
++    eq(nz("کتاب دنیل بل* را"), "کتاب دنیل بل را", "trailing marker")
+ 
+ 
+ def test_latin_resolution():
+@@ -248,6 +339,133 @@
            "transliterate leaves no Latin", nz3("برند Sharp"), "no ascii")
  
  
