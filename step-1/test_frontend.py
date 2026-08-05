@@ -536,18 +536,23 @@ def test_build_dataset_preserves_audio():
             w.writeframes(fill * int(16000 * sec))
         return b.getvalue()
 
-    rows = [("در سال ۱۴۰۳ رشد داشت", 5.0, b"\x11\x22", 4.2),
-            ("این کیفیت پایین است", 4.0, b"\x33\x44", 2.1)]
+    AU = pa.struct([("bytes", pa.binary()), ("path", pa.string())])
+    rows = [("در سال ۱۴۰۳ رشد داشت", 5.0, b"\x11\x22", 4.2, wav(2.0, b"\x55\x66")),
+            ("این کیفیت پایین است", 4.0, b"\x33\x44", 2.1, None)]
     with tempfile.TemporaryDirectory() as d:
         src, out = str(Path(d) / "src"), str(Path(d) / "out")
         Path(src).mkdir()
         tbl = pa.table({
             "sentence": pa.array([r[0] for r in rows]),
             "audio": pa.array([{"bytes": wav(r[1], r[2]), "path": None}
-                               for r in rows],
-                              type=pa.struct([("bytes", pa.binary()),
-                                              ("path", pa.string())])),
+                               for r in rows], type=AU),
             "mos_bak": pa.array([r[3] for r in rows], type=pa.float64()),
+            # a second audio column, null on some rows, plus a nested struct
+            "audio_ref": pa.array([{"bytes": r[4], "path": None} if r[4] else None
+                                   for r in rows], type=AU),
+            "metrics": pa.array([{"tier": "keep", "cer": 0.02}] * len(rows),
+                                type=pa.struct([("tier", pa.string()),
+                                                ("cer", pa.float32())])),
         })
         with pa.OSFile(str(Path(src) / "data-00000-of-00001.arrow"), "wb") as s:
             w = pa.ipc.new_stream(s, tbl.schema)
@@ -559,6 +564,7 @@ def test_build_dataset_preserves_audio():
             text_field="sentence", audio_field="audio",
             duration_field="duration", duration_from_audio=True,
             sampling_rate=16000, shard_mb=500, keep_fields="mos_bak",
+            carry_fields="audio_ref,metrics", audio_feature_fields=None,
             min_field=["mos_bak=3.0"], max_field=[], drop_text_matching=None,
             min_duration=0.0, max_duration=0.0, min_words=2, max_chars=600,
             dataset_id=1, tier="core", strip_harakat=False, keep_parens=False,
@@ -578,6 +584,18 @@ def test_build_dataset_preserves_audio():
         feats = json.loads(t.schema.metadata[b"huggingface"])["info"]["features"]
         eq(feats["audio"]["_type"], "Audio", "audio stays an Audio feature")
         eq(feats["audio"]["sampling_rate"], 16000, "sampling rate declared")
+        # a carried second audio column must also come back as Audio, and a
+        # carried struct must keep its nested field types
+        eq(feats["audio_ref"]["_type"], "Audio",
+           "carried reference audio is an Audio feature")
+        eq(feats["metrics"]["cer"]["dtype"], "float32",
+           "carried struct keeps nested dtypes")
+        ref = t.column("audio_ref").to_pylist()[0]
+        eq(hashlib.md5(ref["bytes"]).hexdigest(),
+           hashlib.md5(wav(2.0, b"\x55\x66")).hexdigest(),
+           "reference audio bytes survive byte-identical")
+        eq(t.column("metrics").to_pylist()[0]["tier"], "keep",
+           "carried struct values survive")
         # the save_to_disk sidecars datasets.load_from_disk needs
         info = json.load(open(str(Path(out) / "dataset_info.json")))
         state = json.load(open(str(Path(out) / "state.json")))

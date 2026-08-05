@@ -794,6 +794,10 @@ def run_build(args):
     keep_fields = [f for f in (args.keep_fields or "").split(",") if f]
     wanted = list(dict.fromkeys(keep_fields + list(bounds)))
     drop_re = re.compile(args.drop_text_matching) if args.drop_text_matching else None
+    carry = [f for f in (args.carry_fields or "").split(",") if f]
+    audio_feature_names = {args.audio_field.rsplit(".", 1)[-1]} | {
+        f.strip() for f in (args.audio_feature_fields or "").split(",") if f.strip()}
+    missing_carry = set()
 
     files = arrow_fragments(args.input, split=args.split)
     outdir = args.output_dataset
@@ -934,9 +938,22 @@ def run_build(args):
                 if name in extras:
                     cols[name] = pa.array([extras[name][k] for k in keep],
                                           type=pa.float64())
+            # Arbitrary columns kept at their source type -- a second audio
+            # column, a metrics struct, an alternate transcript. Selected with
+            # the same Arrow take, so payloads never enter Python.
+            for name in carry:
+                col = _column(pa, batch, name)
+                if col is None:
+                    if name not in missing_carry:
+                        missing_carry.add(name)
+                        print(f"!! no {name!r} column -- --carry-fields skipped it",
+                              file=sys.stderr)
+                    continue
+                cols[name.rsplit(".", 1)[-1]] = col.take(idx)
 
             if schema[0] is None:
-                schema[0] = _hf_schema(pa, cols, args.sampling_rate)
+                schema[0] = _hf_schema(pa, cols, args.sampling_rate,
+                                       audio_names=audio_feature_names)
             rb = pa.RecordBatch.from_arrays(list(cols.values()),
                                             schema=schema[0])
             if writer["w"] is None:
@@ -944,7 +961,7 @@ def run_build(args):
             writer["w"].write_batch(rb)
             writer["rows"] += rb.num_rows
             writer["bytes"] += rb.nbytes
-            if writer["bytes"] >= shard_bytes:
+            if shard_bytes and writer["bytes"] >= shard_bytes:
                 close_shard()
     close_shard()
 
@@ -977,19 +994,41 @@ def run_build(args):
     return 0
 
 
-def _hf_schema(pa, cols, sampling_rate):
-    """Arrow schema carrying the `datasets` feature block, so `audio` comes back
-    as an Audio column rather than a raw struct."""
-    features = {}
-    for name, arr in cols.items():
-        if name == "audio":
-            features[name] = {"sampling_rate": sampling_rate, "_type": "Audio"}
-        elif pa.types.is_string(arr.type):
-            features[name] = {"dtype": "string", "_type": "Value"}
-        elif pa.types.is_int64(arr.type):
-            features[name] = {"dtype": "int64", "_type": "Value"}
-        else:
-            features[name] = {"dtype": "float64", "_type": "Value"}
+def _is_audio_struct(pa, typ):
+    """struct<bytes, path> is how `datasets` stores an undecoded Audio column.
+    Recognising it by shape is what lets a second audio column -- a reference
+    clip for voice cloning -- survive as an Audio feature and not as a raw
+    struct the trainer would have to cast by hand."""
+    if not pa.types.is_struct(typ):
+        return False
+    return {f.name for f in typ} == {"bytes", "path"}
+
+
+_ARROW_DTYPE = {
+    "string": "string", "large_string": "string", "bool": "bool",
+    "int8": "int8", "int16": "int16", "int32": "int32", "int64": "int64",
+    "uint8": "uint8", "uint16": "uint16", "uint32": "uint32",
+    "uint64": "uint64", "halffloat": "float16", "float": "float32",
+    "double": "float64", "binary": "binary", "large_binary": "binary",
+}
+
+
+def _feature_for(pa, typ, sampling_rate, audio_names, name):
+    if name in audio_names or _is_audio_struct(pa, typ):
+        return {"sampling_rate": sampling_rate, "_type": "Audio"}
+    if pa.types.is_struct(typ):
+        return {f.name: _feature_for(pa, f.type, sampling_rate, audio_names,
+                                     f.name) for f in typ}
+    if pa.types.is_list(typ) or pa.types.is_large_list(typ):
+        return [_feature_for(pa, typ.value_type, sampling_rate, audio_names, "")]
+    return {"dtype": _ARROW_DTYPE.get(str(typ), str(typ)), "_type": "Value"}
+
+
+def _hf_schema(pa, cols, sampling_rate, audio_names=()):
+    """Arrow schema carrying the `datasets` feature block, so audio columns come
+    back as Audio features rather than raw structs."""
+    features = {n: _feature_for(pa, a.type, sampling_rate, audio_names, n)
+                for n, a in cols.items()}
     schema = pa.schema([(n, a.type) for n, a in cols.items()])
     return schema.with_metadata({
         "huggingface": json.dumps({"info": {"features": features}})})
@@ -1206,7 +1245,13 @@ def main(argv=None):
     b.add_argument("--sampling-rate", type=int, default=16000,
                    help="declared on the Audio feature; must match the audio")
     b.add_argument("--shard-mb", type=int, default=500,
-                   help="roll a new shard past this many MB (default 500)")
+                   help="roll a new shard past this many MB; 0 = one file")
+    b.add_argument("--carry-fields", default=None, metavar="A,B",
+                   help="source columns copied through at their own type, e.g. "
+                        "audio_ref,metrics,text_plain")
+    b.add_argument("--audio-feature-fields", default=None, metavar="A,B",
+                   help="carried columns to declare as Audio features; "
+                        "struct<bytes,path> is detected automatically")
     b.add_argument("--keep-fields", default=None, metavar="A,B")
     b.add_argument("--min-field", action="append", default=[], metavar="NAME=V")
     b.add_argument("--max-field", action="append", default=[], metavar="NAME=V")
